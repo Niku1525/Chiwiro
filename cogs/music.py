@@ -432,7 +432,7 @@ def build_now_playing_embed(song: Song, elapsed: float, loop_mode: str) -> disco
 
 
 def format_queue_text(state: "GuildMusicState") -> str:
-    if not state.current and not state.queue:
+    if not state.current and not state.queue and getattr(state, "active_playlist", None) is None:
         return "La cola está vacía."
     lines = []
     if state.current:
@@ -441,6 +441,14 @@ def format_queue_text(state: "GuildMusicState") -> str:
         lines.append("\n**En cola:**")
         for i, song in enumerate(state.queue, start=1):
             lines.append(f"{i}. {song.title} — pedido por {song.requester}")
+            
+    # NUEVO: Mostrar el progreso de la lista en segundo plano
+    pl = getattr(state, "active_playlist", None)
+    if pl:
+        restantes = len(pl["entries"]) - pl["current_index"]
+        if restantes > 0:
+            lines.append(f"\n🎶 **Playlist en segundo plano:** {pl['title']} ({restantes} canciones restantes)")
+            
     if state.loop_mode != "off":
         mode_label = "🔂 canción actual" if state.loop_mode == "song" else "🔁 toda la cola"
         lines.append(f"\nRepetición activa: {mode_label}")
@@ -497,6 +505,7 @@ class MusicControls(discord.ui.View):
     async def stop(self, button: discord.ui.Button, interaction: discord.Interaction):
         state = self.cog.get_state(self.guild_id)
         state.queue.clear()
+        state.active_playlist = None
         state.suppress_requeue = True
         if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
             state.voice_client.stop()
@@ -682,6 +691,7 @@ class GuildMusicState:
         self.empty_since: Optional[float] = None
 
         self.history: list[Song] = []
+        self.active_playlist: Optional[dict] = None
 
     def mark_paused(self):
         if self.pause_started_at is None:
@@ -728,6 +738,36 @@ class GuildMusicState:
             self.suppress_requeue = False
             self.skip_song_loop_once = False
 
+            if not self.queue and self.active_playlist:
+                pl = self.active_playlist
+                while pl["current_index"] < len(pl["entries"]):
+                    entry = pl["entries"][pl["current_index"]]
+                    pl["current_index"] += 1
+                    
+                    if not entry:
+                        continue
+                        
+                    video_id = entry.get("id")
+                    webpage_url = entry.get("url") or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
+                    
+                    if not webpage_url:
+                        continue
+                        
+                    song = Song(
+                        title=entry.get("title", "Sin título"),
+                        webpage_url=webpage_url,
+                        duration=entry.get("duration"),
+                        requester=f"{pl['requester']}",
+                        thumbnail=pick_thumbnail(entry)
+                    )
+                    self.queue.append(song) # Metemos solo la que sigue y rompemos el ciclo
+                    break 
+                
+                # Si llegamos al final de la playlist, la borramos
+                if pl["current_index"] >= len(pl["entries"]):
+                    self.active_playlist = None
+
+            # CÓDIGO EXISTENTE:
             try:
                 self.current = self.queue.popleft()
             except IndexError:
@@ -858,6 +898,17 @@ class Music(commands.Cog):
             # Como plan B, por si devuelve un único resultado sin meterlo en 'entries'
             return [info]
 
+        return await loop.run_in_executor(None, _run)
+    
+    async def _extract_playlist(self, url: str) -> dict:
+        loop = asyncio.get_event_loop()
+        def _run():
+            opts = dict(YTDL_OPTS)
+            opts["extract_flat"] = True # Esto hace que cargue al instante
+            opts["noplaylist"] = False
+            opts.pop("default_search", None)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
         return await loop.run_in_executor(None, _run)
 
     async def handle_play_request(
@@ -1009,6 +1060,7 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que querés buscar"),
     ):
+        # 1. Manejo de Spotify
         spotify_match = parse_spotify_url(query) if "open.spotify.com" in query else None
         if spotify_match:
             await self._handle_spotify(ctx, spotify_match)
@@ -1018,6 +1070,52 @@ class Music(commands.Cog):
 
         if is_url:
             await ctx.defer()
+            
+            # 2. NUEVO: Detectar si es un enlace de lista de YouTube (Lazy Loading)
+            if "list=" in query and ("youtube.com" in query or "youtu.be" in query):
+                try:
+                    info = await self._extract_playlist(query)
+                    entries = info.get("entries")
+                    if entries:
+                        entries = list(entries)
+                        state = self.get_state(ctx.guild.id)
+                        
+                        # Validar que el usuario esté en un canal de voz
+                        if ctx.author.voice is None or ctx.author.voice.channel is None:
+                            await ctx.respond("Tenés que estar en un canal de voz primero.")
+                            return
+                            
+                        voice_channel = ctx.author.voice.channel
+                        
+                        # Conexión inteligente al canal (usando la corrección anterior)
+                        if ctx.guild.voice_client is None or not ctx.guild.voice_client.is_connected():
+                            state.voice_client = await voice_channel.connect()
+                            state.history = []
+                        else:
+                            state.voice_client = ctx.guild.voice_client
+                            if state.voice_client.channel.id != voice_channel.id:
+                                await state.voice_client.move_to(voice_channel)
+                                
+                        state.text_channel = ctx.channel
+                        
+                        # Guardamos la playlist en el estado para que el loop la consuma de a poco
+                        state.active_playlist = {
+                            "title": info.get("title", "Lista de reproducción"),
+                            "entries": entries,
+                            "current_index": 0,
+                            "requester": ctx.author.display_name
+                        }
+                        
+                        await ctx.respond(
+                            f"🎶 Playlist cargada en segundo plano: **{info.get('title', 'Sin título')}** ({len(entries)} canciones).\n"
+                            f"*(Se irá añadiendo de a una. Si piden una canción suelta, se tocará primero y luego se retomará la lista).*")
+                        return
+                        
+                except Exception as e:
+                    log.exception("Fallo al extraer playlist, procediendo como video único.")
+                    # Si falla, simplemente saltará al bloque de abajo y tratará de procesarlo como un solo video.
+
+            # 3. Manejo de URL individual (o fallback de playlist fallida)
             try:
                 info = await self._extract(query)
             except Exception as e:
@@ -1037,6 +1135,7 @@ class Music(commands.Cog):
             await ctx.respond(msg)
             return
 
+        # 4. Manejo de búsqueda por nombre
         await ctx.defer(ephemeral=True)
         try:
             results = await self._search(query)
@@ -1050,7 +1149,7 @@ class Music(commands.Cog):
             return
 
         view = SearchResultsView(self, ctx.guild, ctx.author, ctx.channel, results)
-        await ctx.respond(f"Resultados para **{query}**, elegí uno:", view=view)
+        await ctx.respond(f"Resultados para **{query}**, elegí uno:", view=view)    
 
     @commands.slash_command(name="skip", description="Salta la canción actual")
     async def skip(self, ctx: discord.ApplicationContext):
@@ -1086,6 +1185,7 @@ class Music(commands.Cog):
     async def stop(self, ctx: discord.ApplicationContext):
         state = self.get_state(ctx.guild.id)
         state.queue.clear()
+        state.active_playlist = None
         state.suppress_requeue = True
         if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
             state.voice_client.stop()
@@ -1095,6 +1195,7 @@ class Music(commands.Cog):
     async def leave(self, ctx: discord.ApplicationContext):
         state = self.get_state(ctx.guild.id)
         state.queue.clear()
+        state.active_playlist = None
         state.suppress_requeue = True
         state.history = []
         if state.voice_client:
@@ -1205,6 +1306,7 @@ class Music(commands.Cog):
             return
 
         state.queue.clear()
+        state.active_playlist = None
         state.suppress_requeue = True
         state.history = []
         await state.voice_client.disconnect()
