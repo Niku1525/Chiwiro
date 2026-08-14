@@ -1,0 +1,1218 @@
+import asyncio
+import html
+import json
+import logging
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Optional
+
+import discord
+from discord.ext import commands
+from discord import Option
+import requests
+import yt_dlp
+
+log = logging.getLogger("music")
+
+YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "extract_flat": False,
+    "remote_components": "ejs:github",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios", "mweb"]
+        }
+    },
+}
+
+_cookies_file = os.getenv("YTDLP_COOKIES_FILE")
+_cookies_browser = os.getenv("YTDLP_COOKIES_BROWSER")
+if _cookies_file:
+    YTDL_OPTS["cookiefile"] = _cookies_file
+    log.info(f"Usando cookies desde archivo: {_cookies_file}")
+elif _cookies_browser:
+    YTDL_OPTS["cookiesfrombrowser"] = (_cookies_browser,)
+    log.info(f"Usando cookies de YouTube desde el navegador: {_cookies_browser}")
+
+PCM_SAMPLE_RATE = 48000
+PCM_CHANNELS = 2
+PCM_BYTES_PER_SAMPLE = 2
+PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_BYTES_PER_SAMPLE
+FRAME_SIZE = 3840
+
+PREBUFFER_SECONDS = float(os.getenv("PREBUFFER_SECONDS", "30"))
+PREBUFFER_BYTES = int(PREBUFFER_SECONDS * PCM_BYTES_PER_SECOND)
+
+MAX_BUFFER_BYTES = int(os.getenv("MAX_BUFFER_BYTES", str(500 * 1024 * 1024)))
+
+AUTO_DISCONNECT_SECONDS = float(os.getenv("AUTO_DISCONNECT_SECONDS", "120"))
+
+MAX_HISTORY = 100
+
+ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "guild_settings.json")
+_settings_lock = threading.Lock()
+
+
+def _load_settings() -> dict:
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        log.exception("No se pudo leer guild_settings.json, empiezo de cero")
+        return {}
+
+
+def _save_settings(data: dict):
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        log.exception("No se pudo guardar guild_settings.json")
+
+
+_settings = _load_settings()
+
+
+def get_guild_volume(guild_id: int) -> float:
+    with _settings_lock:
+        return _settings.get(str(guild_id), {}).get("volume", 0.5)
+
+
+def set_guild_volume(guild_id: int, volume: float):
+    with _settings_lock:
+        _settings.setdefault(str(guild_id), {})["volume"] = volume
+        _save_settings(_settings)
+
+
+def _cookie_cli_args() -> list[str]:
+    if _cookies_file:
+        return ["--cookies", _cookies_file]
+    elif _cookies_browser:
+        return ["--cookies-from-browser", _cookies_browser]
+    return []
+
+
+def spawn_playback_pipeline(webpage_url: str) -> tuple[subprocess.Popen, subprocess.Popen]:
+    ytdlp_args = [
+        sys.executable, "-m", "yt_dlp",
+        "-f", "bestaudio/best",
+        "-o", "-",
+        "--quiet",
+        "--no-warnings",
+        "--no-playlist",
+        "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=android,ios,mweb",
+        *_cookie_cli_args(),
+        webpage_url,
+    ]
+    ytdlp_proc = subprocess.Popen(
+        ytdlp_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+
+    ffmpeg_args = [
+        "ffmpeg",
+        "-i", "-",
+        "-f", "s16le",
+        "-ar", str(PCM_SAMPLE_RATE),
+        "-ac", str(PCM_CHANNELS),
+        "-loglevel", "warning",
+        "-vn",
+        "pipe:1",
+    ]
+    ffmpeg_proc = subprocess.Popen(
+        ffmpeg_args,
+        stdin=ytdlp_proc.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+    ytdlp_proc.stdout.close()
+
+    return ytdlp_proc, ffmpeg_proc
+
+
+class BufferedPCMSource(discord.AudioSource):
+    def __init__(self, stdout_stream, prebuffer_bytes: int = PREBUFFER_BYTES, max_buffer_bytes: int = MAX_BUFFER_BYTES):
+        self._stream = stdout_stream
+        self._buffer = bytearray()
+        self._read_pos = 0
+        self._cond = threading.Condition()
+        self._eof = False
+        self._closed = False
+        self._prebuffer_bytes = min(prebuffer_bytes, max_buffer_bytes)
+        self._max_buffer_bytes = max_buffer_bytes
+        self._ready_event = threading.Event()
+        self._reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self._reader_thread.start()
+
+    def _pending_bytes(self) -> int:
+        return len(self._buffer) - self._read_pos
+
+    def _reader(self):
+        try:
+            while True:
+                if self._closed:
+                    return
+                chunk = self._stream.read(65536)
+                if not chunk:
+                    with self._cond:
+                        self._eof = True
+                        self._ready_event.set()
+                        self._cond.notify_all()
+                    return
+                with self._cond:
+                    while self._pending_bytes() >= self._max_buffer_bytes and not self._closed:
+                        self._cond.wait(timeout=1.0)
+                    if self._closed:
+                        return
+                    self._buffer.extend(chunk)
+                    if not self._ready_event.is_set() and self._pending_bytes() >= self._prebuffer_bytes:
+                        self._ready_event.set()
+                    self._cond.notify_all()
+        except Exception:
+            log.exception("Error leyendo el stream de audio")
+            with self._cond:
+                self._eof = True
+                self._ready_event.set()
+                self._cond.notify_all()
+
+    def wait_until_ready(self, timeout: float = 20.0):
+        self._ready_event.wait(timeout)
+
+    def read(self) -> bytes:
+        with self._cond:
+            if self._pending_bytes() >= FRAME_SIZE:
+                start = self._read_pos
+                end = start + FRAME_SIZE
+                data = bytes(self._buffer[start:end])
+                self._read_pos = end
+                if self._read_pos >= 1_048_576 or self._read_pos * 2 >= len(self._buffer):
+                    del self._buffer[:self._read_pos]
+                    self._read_pos = 0
+                self._cond.notify_all()
+                return data
+            if self._eof:
+                if self._pending_bytes() <= 0:
+                    return b""
+                data = bytes(self._buffer[self._read_pos:]).ljust(FRAME_SIZE, b"\x00")
+                self._buffer.clear()
+                self._read_pos = 0
+                self._cond.notify_all()
+                return data
+        return b"\x00" * FRAME_SIZE
+
+    def is_opus(self) -> bool:
+        return False
+
+    def cleanup(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if not seconds:
+        return "en vivo"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def build_progress_bar(elapsed: float, total: Optional[float], length: int = 20) -> str:
+    if not total:
+        return "🔴 En vivo / duración desconocida"
+    ratio = max(0.0, min(elapsed / total, 1.0))
+    filled = int(ratio * length)
+    filled = min(filled, length - 1)
+    bar = "▬" * filled + "🔘" + "▬" * (length - filled - 1)
+    return f"{bar}\n`{format_duration(elapsed)} / {format_duration(total)}`"
+
+
+def pick_thumbnail(info: dict) -> Optional[str]:
+    thumb = info.get("thumbnail")
+    if thumb:
+        return thumb
+    thumbs = info.get("thumbnails")
+    if thumbs:
+        return thumbs[-1].get("url")
+    return None
+
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+SPOTIFY_URL_RE = re.compile(
+    r"open\.spotify\.com/(?:intl-[a-z]{2}/)?(track|album|playlist)/([A-Za-z0-9]+)"
+)
+
+_spotify_token: Optional[str] = None
+_spotify_token_expiry: float = 0.0
+_spotify_lock = threading.Lock()
+
+
+def spotify_configured() -> bool:
+    return bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
+
+
+def parse_spotify_url(url: str) -> Optional[tuple[str, str]]:
+    match = SPOTIFY_URL_RE.search(url)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _get_spotify_token() -> str:
+    global _spotify_token, _spotify_token_expiry
+    with _spotify_lock:
+        if _spotify_token and time.time() < _spotify_token_expiry - 30:
+            return _spotify_token
+        resp = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _spotify_token = data["access_token"]
+        _spotify_token_expiry = time.time() + data.get("expires_in", 3600)
+        return _spotify_token
+
+
+def _spotify_get(path: str, params: Optional[dict] = None) -> dict:
+    token = _get_spotify_token()
+    resp = requests.get(
+        f"https://api.spotify.com/v1{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=10,
+    )
+    if not resp.ok:
+        log.error(f"Spotify API {resp.status_code} en {path}: {resp.text}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+_SPOTIFY_META_RE_CACHE: dict[str, re.Pattern] = {}
+
+
+def _spotify_meta_tag(html_text: str, prop: str) -> Optional[str]:
+    if prop not in _SPOTIFY_META_RE_CACHE:
+        _SPOTIFY_META_RE_CACHE[prop] = re.compile(
+            r'<meta[^>]+(?:property|name)=["\']' + re.escape(prop) + r'["\'][^>]+content=["\']([^"\']*)["\']'
+            r'|<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']' + re.escape(prop) + r'["\']'
+        )
+    match = _SPOTIFY_META_RE_CACHE[prop].search(html_text)
+    if not match:
+        return None
+    return html.unescape(match.group(1) or match.group(2))
+
+
+def fetch_spotify_track_public(item_id: str) -> dict:
+    resp = requests.get(
+        f"https://open.spotify.com/track/{item_id}",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    page = resp.text
+    title = _spotify_meta_tag(page, "og:title") or ""
+    artist = _spotify_meta_tag(page, "music:musician_description") or ""
+    if not title:
+        log.error(
+            f"No encontré meta tags en la página de Spotify para {item_id}. "
+            f"Longitud de la respuesta: {len(page)} bytes. "
+            f"Primeros 500 caracteres: {page[:500]!r}"
+        )
+    return {"title": title, "artists": artist}
+
+
+def fetch_spotify_tracks(kind: str, item_id: str) -> list[dict]:
+    tracks: list[dict] = []
+
+    if kind == "track":
+        return [fetch_spotify_track_public(item_id)]
+
+    if kind == "album":
+        album = _spotify_get(f"/albums/{item_id}")
+        album_artists = ", ".join(a["name"] for a in album.get("artists", []))
+        items = album.get("tracks", {}).get("items", [])
+        total = album.get("tracks", {}).get("total", len(items))
+        offset = len(items)
+        all_items = list(items)
+        while offset < total:
+            page = _spotify_get(
+                f"/albums/{item_id}/tracks", params={"limit": 50, "offset": offset}
+            )
+            page_items = page.get("items", [])
+            if not page_items:
+                break
+            all_items.extend(page_items)
+            offset += len(page_items)
+        for t in all_items:
+            artists = ", ".join(a["name"] for a in t.get("artists", [])) or album_artists
+            tracks.append({"title": t.get("name", ""), "artists": artists})
+        return tracks
+
+    if kind == "playlist":
+        offset = 0
+        while True:
+            page = _spotify_get(
+                f"/playlists/{item_id}/tracks",
+                params={
+                    "limit": 100,
+                    "offset": offset,
+                    "fields": "items(track(name,artists(name))),next",
+                },
+            )
+            items = page.get("items", [])
+            if not items:
+                break
+            for it in items:
+                t = it.get("track")
+                if not t:
+                    continue
+                artists = ", ".join(a["name"] for a in t.get("artists", []))
+                tracks.append({"title": t.get("name", ""), "artists": artists})
+            offset += len(items)
+            if not page.get("next"):
+                break
+        return tracks
+
+    return tracks
+
+
+@dataclass
+class Song:
+    title: str
+    webpage_url: str
+    duration: Optional[int]
+    requester: str
+    thumbnail: Optional[str] = None
+
+
+def build_now_playing_embed(song: Song, elapsed: float, loop_mode: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎵 Reproduciendo ahora",
+        description=f"**[{song.title}]({song.webpage_url})**\n\n{build_progress_bar(elapsed, song.duration)}",
+        color=discord.Color.blurple(),
+    )
+    if song.thumbnail:
+        embed.set_thumbnail(url=song.thumbnail)
+    footer = f"Pedido por {song.requester}"
+    if loop_mode == "song":
+        footer += " • 🔂 Repitiendo esta canción"
+    elif loop_mode == "queue":
+        footer += " • 🔁 Repitiendo la cola"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def format_queue_text(state: "GuildMusicState") -> str:
+    if not state.current and not state.queue:
+        return "La cola está vacía."
+    lines = []
+    if state.current:
+        lines.append(f"**Sonando ahora:** {state.current.title}")
+    if state.queue:
+        lines.append("\n**En cola:**")
+        for i, song in enumerate(state.queue, start=1):
+            lines.append(f"{i}. {song.title} — pedido por {song.requester}")
+    if state.loop_mode != "off":
+        mode_label = "🔂 canción actual" if state.loop_mode == "song" else "🔁 toda la cola"
+        lines.append(f"\nRepetición activa: {mode_label}")
+    return "\n".join(lines)
+
+
+class MusicControls(discord.ui.View):
+    LOOP_LABELS = {
+        "off": "🔁 Repetir: Off",
+        "song": "🔂 Repetir: Canción",
+        "queue": "🔁 Repetir: Cola",
+    }
+    LOOP_ORDER = ["off", "song", "queue"]
+
+    def __init__(self, cog: "Music", guild_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.guild_id = guild_id
+        state = self.cog.get_state(guild_id)
+        self.loop_button.label = self.LOOP_LABELS[state.loop_mode]
+
+    @discord.ui.button(label="⏸️ Pausar", style=discord.ButtonStyle.primary, row=0)
+    async def pause_resume(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        if not state.voice_client:
+            await interaction.response.send_message("No estoy en un canal de voz.", ephemeral=True)
+            return
+        if state.voice_client.is_playing():
+            state.voice_client.pause()
+            state.mark_paused()
+            button.label = "▶️ Reanudar"
+            button.style = discord.ButtonStyle.success
+            await interaction.response.edit_message(view=self)
+        elif state.voice_client.is_paused():
+            state.voice_client.resume()
+            state.mark_resumed()
+            button.label = "⏸️ Pausar"
+            button.style = discord.ButtonStyle.primary
+            await interaction.response.edit_message(view=self)
+        else:
+            await interaction.response.send_message("No hay nada reproduciéndose.", ephemeral=True)
+
+    @discord.ui.button(label="⏭️ Saltar", style=discord.ButtonStyle.primary, row=0)
+    async def skip(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.skip_song_loop_once = True
+            state.voice_client.stop()
+            await interaction.response.send_message("⏭️ Canción saltada.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No hay nada sonando ahora mismo.", ephemeral=True)
+
+    @discord.ui.button(label="⏹️ Detener", style=discord.ButtonStyle.danger, row=0)
+    async def stop(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        state.queue.clear()
+        state.suppress_requeue = True
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.voice_client.stop()
+        await interaction.response.send_message("⏹️ Detenido y cola vaciada.", ephemeral=True)
+
+    @discord.ui.button(label="📜 Lista", style=discord.ButtonStyle.secondary, row=0)
+    async def show_queue(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        await interaction.response.send_message(format_queue_text(state))
+
+    @discord.ui.button(label="🔁 Repetir: Off", style=discord.ButtonStyle.secondary, row=1)
+    async def loop_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        idx = self.LOOP_ORDER.index(state.loop_mode)
+        state.loop_mode = self.LOOP_ORDER[(idx + 1) % len(self.LOOP_ORDER)]
+        button.label = self.LOOP_LABELS[state.loop_mode]
+        if state.current:
+            embed = build_now_playing_embed(state.current, state.get_elapsed(), state.loop_mode)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="🔀 Mezclar", style=discord.ButtonStyle.secondary, row=1)
+    async def shuffle_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        if len(state.queue) < 2:
+            await interaction.response.send_message(
+                "No hay suficientes canciones en la cola para mezclar.", ephemeral=True
+            )
+            return
+        items = list(state.queue)
+        random.shuffle(items)
+        state.queue = deque(items)
+        await interaction.response.send_message(f"🔀 Mezclé {len(items)} canciones en la cola.", ephemeral=True)
+
+    @discord.ui.button(label="🕘 Historial", style=discord.ButtonStyle.secondary, row=1)
+    async def history_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        if not state.history:
+            await interaction.response.send_message("Todavía no sonó nada en esta sesión.", ephemeral=True)
+            return
+        view = HistoryView(self.cog, self.guild_id, interaction.user.id, state.history)
+        await interaction.response.send_message(
+            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elegí una:",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class SearchResultsView(discord.ui.View):
+    def __init__(self, cog: "Music", guild: discord.Guild, author: discord.Member,
+                 text_channel: discord.abc.Messageable, results: list[dict]):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.guild = guild
+        self.author = author
+        self.text_channel = text_channel
+        self.results = results[:5]
+
+        options = []
+        for i, r in enumerate(self.results):
+            title = (r.get("title") or "Sin título")[:100]
+            duration = r.get("duration")
+            desc = format_duration(duration) if duration else "Duración desconocida"
+            options.append(discord.SelectOption(label=title, description=desc, value=str(i)))
+
+        self.select = discord.ui.Select(placeholder="Elegí un resultado...", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message(
+                "Solo quien hizo la búsqueda puede elegir un resultado.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
+        idx = int(self.select.values[0])
+        entry = self.results[idx]
+        title = entry.get("title") or "Sin título"
+        video_id = entry.get("id")
+        webpage_url = (
+            entry.get("webpage_url")
+            or (f"https://www.youtube.com/watch?v={video_id}" if video_id else entry.get("url"))
+        )
+        duration = entry.get("duration")
+        thumbnail = pick_thumbnail(entry)
+
+        _, msg = await self.cog.handle_play_request(
+            self.guild, interaction.user, self.text_channel, title, webpage_url, duration, thumbnail
+        )
+
+        await self.text_channel.send(msg)
+
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+
+class HistoryView(discord.ui.View):
+    def __init__(self, cog: "Music", guild_id: int, author_id: int, history_songs: list["Song"]):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.author_id = author_id
+
+        unique_songs = []
+        seen_urls = set()
+
+        for song in reversed(history_songs):
+            if song.webpage_url not in seen_urls:
+                seen_urls.add(song.webpage_url)
+                unique_songs.append(song)
+
+        self.entries = unique_songs[:25]
+
+        options = []
+        for i, song in enumerate(self.entries):
+            title = song.title[:100]
+            desc = format_duration(song.duration) if song.duration else "Duración desconocida"
+            options.append(discord.SelectOption(label=title, description=desc, value=str(i)))
+
+        self.select = discord.ui.Select(placeholder="Elegí una canción del historial...", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Solo quien pidió el historial puede elegir acá.", ephemeral=True
+            )
+            return
+
+        idx = int(self.select.values[0])
+        song = self.entries[idx]
+
+        state = self.cog.get_state(self.guild_id)
+        state.queue.appendleft(song)
+
+        for item in self.children:
+            item.disabled = True
+        try:
+            await interaction.response.edit_message(
+                content=f"⏮️ **{song.title}** va a sonar apenas termine la actual.",
+                view=self,
+            )
+        except discord.HTTPException:
+            pass
+        self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+class GuildMusicState:
+    def __init__(self, cog: "Music", bot: commands.Bot, guild_id: int):
+        self.cog = cog
+        self.bot = bot
+        self.guild_id = guild_id
+        self.queue: deque[Song] = deque()
+        self.voice_client: Optional[discord.VoiceClient] = None
+        self.current: Optional[Song] = None
+        self.current_processes: tuple[subprocess.Popen, subprocess.Popen] = ()
+        self.volume: float = get_guild_volume(guild_id)
+        self.play_next_event = asyncio.Event()
+        self.player_task = bot.loop.create_task(self._player_loop())
+        self.text_channel: Optional[discord.abc.Messageable] = None
+
+        self.loop_mode: str = "off"
+        self.suppress_requeue: bool = False
+        self.skip_song_loop_once: bool = False
+
+        self.now_playing_msg: Optional[discord.Message] = None
+        self.playback_started_at: Optional[float] = None
+        self.pause_started_at: Optional[float] = None
+        self.total_paused_seconds: float = 0.0
+        self.progress_task: Optional[asyncio.Task] = None
+
+        self.empty_since: Optional[float] = None
+
+        self.history: list[Song] = []
+
+    def mark_paused(self):
+        if self.pause_started_at is None:
+            self.pause_started_at = time.monotonic()
+
+    def mark_resumed(self):
+        if self.pause_started_at is not None:
+            self.total_paused_seconds += time.monotonic() - self.pause_started_at
+            self.pause_started_at = None
+
+    def get_elapsed(self) -> float:
+        if self.playback_started_at is None:
+            return 0.0
+        now = time.monotonic()
+        paused_extra = (now - self.pause_started_at) if self.pause_started_at else 0.0
+        return max(0.0, now - self.playback_started_at - self.total_paused_seconds - paused_extra)
+
+    async def _update_progress_loop(self):
+        try:
+            while True:
+                await asyncio.sleep(5)
+                if not self.now_playing_msg or not self.current:
+                    return
+                if not (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())):
+                    return
+                embed = build_now_playing_embed(self.current, self.get_elapsed(), self.loop_mode)
+                try:
+                    await self.now_playing_msg.edit(embed=embed)
+                except discord.HTTPException:
+                    return
+        except asyncio.CancelledError:
+            pass
+
+    async def _player_loop(self):
+        await self.bot.wait_until_ready()
+        while True:
+            self.play_next_event.clear()
+
+            if self.current is not None and not self.suppress_requeue:
+                if self.loop_mode == "queue":
+                    self.queue.append(self.current)
+                elif self.loop_mode == "song" and not self.skip_song_loop_once:
+                    self.queue.appendleft(self.current)
+            self.suppress_requeue = False
+            self.skip_song_loop_once = False
+
+            try:
+                self.current = self.queue.popleft()
+            except IndexError:
+                self.current = None
+                await asyncio.sleep(1)
+                continue
+
+            if self.voice_client is None or not self.voice_client.is_connected():
+                continue
+
+            preparing_msg = None
+            if self.text_channel:
+                preparing_msg = await self.text_channel.send(
+                    f"🔄 Preparando: **{self.current.title}**..."
+                )
+
+            loop = asyncio.get_event_loop()
+            try:
+                ytdlp_proc, ffmpeg_proc = await loop.run_in_executor(
+                    None, spawn_playback_pipeline, self.current.webpage_url
+                )
+            except Exception:
+                log.exception("No se pudo lanzar el pipeline de audio")
+                if preparing_msg:
+                    await preparing_msg.edit(
+                        content=f"⚠️ No se pudo preparar **{self.current.title}**, la salteo."
+                    )
+                continue
+
+            self.current_processes = (ytdlp_proc, ffmpeg_proc)
+            source = BufferedPCMSource(ffmpeg_proc.stdout)
+
+            await loop.run_in_executor(None, source.wait_until_ready, 20.0)
+
+            source = discord.PCMVolumeTransformer(source, volume=self.volume)
+
+            def _after(error, guild_id=self.guild_id, procs=(ytdlp_proc, ffmpeg_proc)):
+                if error:
+                    log.error(f"Error en reproducción (guild {guild_id}): {error}")
+                for p in procs:
+                    if p.poll() is None:
+                        p.terminate()
+                if self.progress_task:
+                    self.bot.loop.call_soon_threadsafe(self.progress_task.cancel)
+                self.bot.loop.call_soon_threadsafe(self.play_next_event.set)
+
+            self.voice_client.play(source, after=_after)
+
+            self.playback_started_at = time.monotonic()
+            self.pause_started_at = None
+            self.total_paused_seconds = 0.0
+
+            self.history = [s for s in self.history if s.webpage_url != self.current.webpage_url]
+            self.history.append(self.current)
+            if len(self.history) > MAX_HISTORY:
+                self.history = self.history[-MAX_HISTORY:]
+
+            embed = build_now_playing_embed(self.current, 0, self.loop_mode)
+            view = MusicControls(self.cog, self.guild_id)
+            if preparing_msg:
+                await preparing_msg.edit(content=None, embed=embed, view=view)
+                self.now_playing_msg = preparing_msg
+            elif self.text_channel:
+                self.now_playing_msg = await self.text_channel.send(embed=embed, view=view)
+
+            if self.progress_task:
+                self.progress_task.cancel()
+            self.progress_task = self.bot.loop.create_task(self._update_progress_loop())
+
+            await self.play_next_event.wait()
+
+    def cleanup(self):
+        self.player_task.cancel()
+        if self.progress_task:
+            self.progress_task.cancel()
+        for p in self.current_processes:
+            if p and p.poll() is None:
+                p.terminate()
+
+
+class Music(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.states: dict[int, GuildMusicState] = {}
+
+    def get_state(self, guild_id: int) -> GuildMusicState:
+        if guild_id not in self.states:
+            self.states[guild_id] = GuildMusicState(self, self.bot, guild_id)
+        return self.states[guild_id]
+
+    async def _extract(self, query: str) -> dict:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            info = ytdl.extract_info(query, download=False, process=False)
+            if "entries" in info:
+                info = next(iter(info["entries"]))
+            return info
+
+        info = await loop.run_in_executor(None, _run)
+        return info
+
+    async def _search(self, query: str, n: int = 5) -> list[dict]:
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            search_opts = dict(YTDL_OPTS)
+            search_opts["extract_flat"] = True
+            search_opts["noplaylist"] = False
+            
+            # Eliminamos default_search y source_address para evitar conflictos
+            search_opts.pop("default_search", None)
+            search_opts.pop("source_address", None)
+            
+            # Forzamos a yt-dlp a que use el motor de búsqueda explícitamente
+            search_query = f"ytsearch{n}:{query}"
+            
+            with yt_dlp.YoutubeDL(search_opts) as searcher:
+                info = searcher.extract_info(search_query, download=False)
+            
+            if not info:
+                return []
+                
+            # yt-dlp suele devolver un diccionario con la clave 'entries' en las búsquedas
+            if "entries" in info:
+                return list(info["entries"])
+            
+            # Como plan B, por si devuelve un único resultado sin meterlo en 'entries'
+            return [info]
+
+        return await loop.run_in_executor(None, _run)
+
+    async def handle_play_request(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        text_channel: discord.abc.Messageable,
+        title: str,
+        webpage_url: str,
+        duration: Optional[int],
+        thumbnail: Optional[str],
+    ) -> tuple[Optional[Song], str]:
+        if member.voice is None or member.voice.channel is None:
+            return None, "Tenés que estar en un canal de voz primero."
+
+        state = self.get_state(guild.id)
+        state.text_channel = text_channel
+
+        voice_channel = member.voice.channel
+        
+        # --- SOLUCIÓN: Revisar guild.voice_client en lugar de solo state.voice_client ---
+        if guild.voice_client is None or not guild.voice_client.is_connected():
+            # Si el bot realmente no está en ningún canal, lo conectamos
+            state.voice_client = await voice_channel.connect()
+            state.history = []
+        else:
+            # Si ya está conectado (incluso si se nos reinició el código), recuperamos la sesión
+            state.voice_client = guild.voice_client
+            # Y si está en un canal distinto al del usuario, lo movemos
+            if state.voice_client.channel.id != voice_channel.id:
+                await state.voice_client.move_to(voice_channel)
+        # --------------------------------------------------------------------------------
+
+        song = Song(
+            title=title,
+            webpage_url=webpage_url,
+            duration=duration,
+            requester=member.display_name,
+            thumbnail=thumbnail,
+        )
+        was_playing = state.current is not None
+        state.queue.append(song)
+
+        msg = f"➕ Agregado a la cola: **{song.title}**" if was_playing else f"✅ Cargado: **{song.title}**"
+        return song, msg
+
+    async def _resolve_spotify_track_to_youtube(self, track: dict) -> Optional[dict]:
+        primary_artist = (track.get("artists") or "").split(",")[0].strip()
+        search_query = f"{primary_artist} - {track['title']}" if primary_artist else track["title"]
+        try:
+            results = await self._search(search_query, n=1)
+        except Exception:
+            log.exception(f"Error buscando en YouTube: {search_query!r}")
+            return None
+        if not results:
+            log.error(f"Búsqueda en YouTube sin resultados para: {search_query!r} (track={track!r})")
+            return None
+        return results[0]
+
+    async def _handle_spotify(self, ctx: discord.ApplicationContext, spotify_match: tuple[str, str]):
+        kind, item_id = spotify_match
+
+        if kind in ("album", "playlist") and not spotify_configured():
+            await ctx.respond(
+                "Álbumes y playlists de Spotify necesitan credenciales configuradas en el bot "
+                "(`SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`, y la cuenta que creó esa app tiene "
+                "que tener Spotify Premium). Canciones sueltas sí funcionan sin nada de eso."
+            )
+            return
+
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.respond("Tenés que estar en un canal de voz primero.")
+            return
+
+        await ctx.defer()
+
+        loop = asyncio.get_event_loop()
+        try:
+            tracks = await loop.run_in_executor(None, fetch_spotify_tracks, kind, item_id)
+        except Exception:
+            log.exception("Error consultando Spotify")
+            await ctx.respond("No pude leer ese link de Spotify. Revisá que sea público y válido.")
+            return
+
+        if not tracks:
+            await ctx.respond("No encontré canciones en ese link de Spotify.")
+            return
+
+        if kind == "track":
+            entry = await self._resolve_spotify_track_to_youtube(tracks[0])
+            if not entry:
+                await ctx.respond(f"No encontré **{tracks[0]['title']}** en YouTube.")
+                return
+            video_id = entry.get("id")
+            webpage_url = entry.get("webpage_url") or (
+                f"https://www.youtube.com/watch?v={video_id}" if video_id else entry.get("url")
+            )
+            _, msg = await self.handle_play_request(
+                ctx.guild,
+                ctx.author,
+                ctx.channel,
+                entry.get("title") or tracks[0]["title"],
+                webpage_url,
+                entry.get("duration"),
+                pick_thumbnail(entry),
+            )
+            await ctx.respond(f"🎧 Desde Spotify: {msg}")
+            return
+
+        await ctx.respond(
+            f"🎧 Encontré {len(tracks)} canciones en Spotify, buscándolas en YouTube y "
+            f"encolando (puede tardar según cuántas sean)..."
+        )
+
+        added = 0
+        failed = 0
+        for track in tracks:
+            entry = await self._resolve_spotify_track_to_youtube(track)
+            if not entry:
+                failed += 1
+                continue
+            video_id = entry.get("id")
+            webpage_url = entry.get("webpage_url") or (
+                f"https://www.youtube.com/watch?v={video_id}" if video_id else entry.get("url")
+            )
+            try:
+                await self.handle_play_request(
+                    ctx.guild,
+                    ctx.author,
+                    ctx.channel,
+                    entry.get("title") or track["title"],
+                    webpage_url,
+                    entry.get("duration"),
+                    pick_thumbnail(entry),
+                )
+                added += 1
+            except Exception:
+                log.exception("Error encolando canción de Spotify")
+                failed += 1
+
+        summary = f"✅ Encolé {added} canciones desde Spotify."
+        if failed:
+            summary += f" No pude encontrar {failed} en YouTube."
+        await ctx.channel.send(summary)
+
+    @commands.slash_command(name="play", description="Reproduce audio desde un link de YouTube/YT Music/Spotify, o buscá por nombre")
+    async def play(
+        self,
+        ctx: discord.ApplicationContext,
+        query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que querés buscar"),
+    ):
+        spotify_match = parse_spotify_url(query) if "open.spotify.com" in query else None
+        if spotify_match:
+            await self._handle_spotify(ctx, spotify_match)
+            return
+
+        is_url = query.startswith("http://") or query.startswith("https://")
+
+        if is_url:
+            await ctx.defer()
+            try:
+                info = await self._extract(query)
+            except Exception as e:
+                log.exception("Error extrayendo metadata")
+                await ctx.respond(f"No pude procesar ese link: `{e}`")
+                return
+
+            _, msg = await self.handle_play_request(
+                ctx.guild,
+                ctx.author,
+                ctx.channel,
+                info.get("title", "Sin título"),
+                info.get("webpage_url") or info.get("url") or query,
+                info.get("duration"),
+                pick_thumbnail(info),
+            )
+            await ctx.respond(msg)
+            return
+
+        await ctx.defer(ephemeral=True)
+        try:
+            results = await self._search(query)
+        except Exception:
+            log.exception("Error buscando en YouTube")
+            await ctx.respond("No pude buscar eso, intentá de nuevo.")
+            return
+
+        if not results:
+            await ctx.respond(f"No encontré resultados para **{query}**.")
+            return
+
+        view = SearchResultsView(self, ctx.guild, ctx.author, ctx.channel, results)
+        await ctx.respond(f"Resultados para **{query}**, elegí uno:", view=view)
+
+    @commands.slash_command(name="skip", description="Salta la canción actual")
+    async def skip(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.skip_song_loop_once = True
+            state.voice_client.stop()
+            await ctx.respond("⏭️ Saltada.")
+        else:
+            await ctx.respond("No hay nada sonando ahora mismo.")
+
+    @commands.slash_command(name="pause", description="Pausa la reproducción")
+    async def pause(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if state.voice_client and state.voice_client.is_playing():
+            state.voice_client.pause()
+            state.mark_paused()
+            await ctx.respond("⏸️ Pausado.")
+        else:
+            await ctx.respond("No hay nada reproduciéndose.")
+
+    @commands.slash_command(name="resume", description="Reanuda la reproducción")
+    async def resume(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if state.voice_client and state.voice_client.is_paused():
+            state.voice_client.resume()
+            state.mark_resumed()
+            await ctx.respond("▶️ Reanudado.")
+        else:
+            await ctx.respond("No hay nada pausado.")
+
+    @commands.slash_command(name="stop", description="Detiene todo y limpia la cola")
+    async def stop(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        state.queue.clear()
+        state.suppress_requeue = True
+        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            state.voice_client.stop()
+        await ctx.respond("⏹️ Detenido y cola vaciada.")
+
+    @commands.slash_command(name="leave", description="Saca al bot del canal de voz")
+    async def leave(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        state.queue.clear()
+        state.suppress_requeue = True
+        state.history = []
+        if state.voice_client:
+            await state.voice_client.disconnect()
+            state.voice_client = None
+        await ctx.respond("👋 Listo, salí del canal.")
+
+    @commands.slash_command(name="queue", description="Muestra la cola de reproducción")
+    async def queue_cmd(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        await ctx.respond(format_queue_text(state))
+
+    @commands.slash_command(name="volume", description="Cambia el volumen (0-100)")
+    async def volume(self, ctx: discord.ApplicationContext, nivel: Option(int, "Volumen de 0 a 100")):
+        if not 0 <= nivel <= 100:
+            await ctx.respond("El nivel tiene que estar entre 0 y 100.")
+            return
+        state = self.get_state(ctx.guild.id)
+        state.volume = nivel / 100
+        set_guild_volume(ctx.guild.id, state.volume)
+        if state.voice_client and state.voice_client.source:
+            state.voice_client.source.volume = state.volume
+        await ctx.respond(f"🔊 Volumen ajustado a {nivel}% (se va a recordar para la próxima).")
+
+    @commands.slash_command(name="loop", description="Repite la canción actual o toda la cola")
+    async def loop_cmd(
+        self,
+        ctx: discord.ApplicationContext,
+        modo: Option(str, "Modo de repetición", choices=["off", "song", "queue"]),
+    ):
+        state = self.get_state(ctx.guild.id)
+        state.loop_mode = modo
+        labels = {
+            "off": "🔁 Repetición desactivada.",
+            "song": "🔂 Repitiendo la canción actual.",
+            "queue": "🔁 Repitiendo toda la cola.",
+        }
+        await ctx.respond(labels[modo])
+
+    @commands.slash_command(name="shuffle", description="Mezcla el orden de la cola")
+    async def shuffle(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if len(state.queue) < 2:
+            await ctx.respond("No hay suficientes canciones en la cola para mezclar.")
+            return
+        items = list(state.queue)
+        random.shuffle(items)
+        state.queue = deque(items)
+        await ctx.respond(f"🔀 Mezclé {len(items)} canciones en la cola.")
+
+    @commands.slash_command(name="remove", description="Quita una canción de la cola por posición")
+    async def remove(
+        self,
+        ctx: discord.ApplicationContext,
+        posicion: Option(int, "Posición en la cola (1 = la próxima)"),
+    ):
+        state = self.get_state(ctx.guild.id)
+        if posicion < 1 or posicion > len(state.queue):
+            await ctx.respond(f"Posición inválida. La cola tiene {len(state.queue)} canciones.")
+            return
+        items = list(state.queue)
+        removed = items.pop(posicion - 1)
+        state.queue = deque(items)
+        await ctx.respond(f"🗑️ Quité de la cola: **{removed.title}**")
+
+    @commands.slash_command(name="history", description="Muestra lo que sonó en esta sesión para volver a ponerlo")
+    async def history(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if not state.history:
+            await ctx.respond("Todavía no sonó nada en esta sesión.")
+            return
+        view = HistoryView(self, ctx.guild.id, ctx.author.id, state.history)
+        await ctx.respond(
+            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elegí una:", view=view
+        )
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+    ):
+        if AUTO_DISCONNECT_SECONDS <= 0:
+            return
+
+        for state in self.states.values():
+            vc = state.voice_client
+            if not vc or not vc.is_connected():
+                continue
+            channel = vc.channel
+            if before.channel != channel and after.channel != channel:
+                continue
+
+            humans = [m for m in channel.members if not m.bot]
+            if not humans:
+                if state.empty_since is None:
+                    state.empty_since = time.monotonic()
+                    self.bot.loop.create_task(self._auto_disconnect_check(state))
+            else:
+                state.empty_since = None
+
+    async def _auto_disconnect_check(self, state: GuildMusicState):
+        await asyncio.sleep(AUTO_DISCONNECT_SECONDS)
+        if state.empty_since is None or not state.voice_client or not state.voice_client.is_connected():
+            return
+        channel = state.voice_client.channel
+        humans = [m for m in channel.members if not m.bot]
+        if humans:
+            state.empty_since = None
+            return
+
+        state.queue.clear()
+        state.suppress_requeue = True
+        state.history = []
+        await state.voice_client.disconnect()
+        state.voice_client = None
+        state.empty_since = None
+        if state.text_channel:
+            await state.text_channel.send("👋 Me fui porque quedé solo en el canal de voz.")
+
+
+def setup(bot: commands.Bot):
+    bot.add_cog(Music(bot))
