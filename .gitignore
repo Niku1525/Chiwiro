@@ -1,0 +1,12 @@
+# Archivos de credenciales e información sensible
+.env
+cookies.txt
+guild_settings.json
+
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Entornos virtuales (si usas uno)
+venv/
+.venv/
