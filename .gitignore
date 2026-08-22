@@ -16,3 +16,6 @@ venv/
 
 # Accesos directos: apuntan a rutas de esta maquina, no sirven en otra
 *.lnk
+
+# Preferencias de la app (tema claro/oscuro)
+app_config.json
