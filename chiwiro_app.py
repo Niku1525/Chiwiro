@@ -11,11 +11,13 @@ import os
 import queue
 import signal
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
 
+import psutil
 from PIL import Image, ImageTk
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -132,6 +134,27 @@ def guardar_config(datos: dict):
         pass
 
 
+def bots_huerfanos() -> list:
+    """Busca instancias de bot.py de ESTA carpeta que hayan quedado dando
+    vueltas: si la app se cierra de golpe (o se mata desde el Administrador
+    de tareas), el proceso hijo sobrevive y se queda conectado a Discord.
+    Con dos vivos el bot contesta dos veces a cada comando."""
+    encontrados = []
+    for proceso in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if proceso.info["pid"] == os.getpid():
+                continue
+            if not (proceso.info["name"] or "").lower().startswith("python"):
+                continue
+            argumentos = proceso.info["cmdline"] or []
+            if any(a.replace("/", "\\").endswith(BOT.replace("/", "\\"))
+                   or a == BOT for a in argumentos):
+                encontrados.append(proceso)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return encontrados
+
+
 def redondeado(canvas, x0, y0, x1, y1, radio, **kwargs):
     """Rectángulo de esquinas redondeadas, como polígono suavizado."""
     puntos = [
@@ -191,7 +214,7 @@ class ChiwiroApp:
         self._estado_clave = "dormido"
         self._estado_detalle = ""
 
-        root.title("Chiwiro Music")
+        root.title("Chiwiro")
         root.geometry("660x520")
         root.minsize(560, 430)
         root.protocol("WM_DELETE_WINDOW", self.al_cerrar)
@@ -369,9 +392,9 @@ class ChiwiroApp:
         if self.icono_tk is not None:
             lienzo.create_image(46, 59, image=self.icono_tk, anchor="w")
 
-        lienzo.create_text(134, 44, text="Chiwiro Music", anchor="w",
+        lienzo.create_text(134, 44, text="Chiwiro", anchor="w",
                            fill=c["titulo"], font=self.f_titulo)
-        lienzo.create_text(136, 74, text="♡  tu bot de música en Discord  ♡",
+        lienzo.create_text(136, 74, text="♡  Tu bot de música en Discord  ♡",
                            anchor="w", fill=c["tenue"], font=self.f_sub)
 
         self._dibujar_pastilla(ancho)
@@ -504,6 +527,20 @@ class ChiwiroApp:
             self.escribir("El token se saca de discord.com/developers/applications "
                           "→ tu app → Bot → Reset Token.", "aviso")
             return
+
+        # Antes de encender, barremos instancias viejas. Sin esto, dos
+        # copias del bot contestan cada comando por duplicado.
+        huerfanos = bots_huerfanos()
+        if huerfanos:
+            self.escribir(f"Había {len(huerfanos)} instancia(s) del bot dando "
+                          f"vueltas de antes. Las cierro para que no conteste "
+                          f"doble.", "aviso")
+            for proceso in huerfanos:
+                try:
+                    proceso.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            psutil.wait_procs(huerfanos, timeout=5)
 
         entorno = dict(os.environ)
         # Sin esto, un título de canción con emoji revienta el log del bot.
@@ -660,6 +697,14 @@ def main():
 
     root = tk.Tk()
     ChiwiroApp(root)
+
+    # Con --minimizado la ventana arranca guardada en la barra de tareas.
+    # Lo usa el acceso directo de inicio automático: el bot se enciende
+    # igual, pero no te salta la ventana cada vez que prendes la PC.
+    # (Tk no hace caso al "minimizado" del acceso directo, por eso el flag.)
+    if "--minimizado" in sys.argv:
+        root.after(120, root.iconify)
+
     root.mainloop()
 
 

@@ -6,7 +6,8 @@ requests>=2.31.0
 
 # Para la app de escritorio (chiwiro_app.py)
 Pillow>=10.0.0
+psutil>=5.9.0
 
-# Solo para herramientas/crear_acceso_directo.py, que le pone el
-# AppUserModelID al acceso directo. El bot y la app no lo necesitan.
+# Solo para las herramientas del acceso directo y el arranque automatico.
+# El bot y la app no lo necesitan para funcionar.
 pywin32>=306
