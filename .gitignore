@@ -3,6 +3,9 @@
 cookies.txt
 guild_settings.json
 
+# Datos de usuarios en tiempo de ejecución (favoritos por user_id de Discord)
+favorites/
+
 # Cache de Python
 __pycache__/
 *.pyc
