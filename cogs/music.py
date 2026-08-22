@@ -980,7 +980,7 @@ class LyricsPickerView(discord.ui.View):
                 )
             )
 
-        self.select = discord.ui.Select(placeholder="Elegí la canción correcta...", options=options)
+        self.select = discord.ui.Select(placeholder="Elige la canción correcta...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
 
@@ -998,7 +998,7 @@ class LyricsPickerView(discord.ui.View):
         if not lyrics:
             await interaction.followup.send(
                 f"No pude leer la letra de **{candidate.get('full_title')}**. "
-                f"Podés verla acá: {candidate['url']}",
+                f"Puedes verla aquí: {candidate['url']}",
                 ephemeral=True,
             )
             return
@@ -1035,12 +1035,12 @@ class LyricsCorrectionView(discord.ui.View):
     async def pick_other(self, button: discord.ui.Button, interaction: discord.Interaction):
         if not self.candidates:
             await interaction.response.send_message(
-                "No tengo otras opciones para esta canción. Probá con `/lyrics <nombre exacto>`.",
+                "No tengo otras opciones para esta canción. Prueba con `/lyrics <nombre exacto>`.",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            "Elegí cuál era la canción:",
+            "Elige cuál era la canción:",
             view=LyricsPickerView(self.candidates, self.song_key),
             ephemeral=True,
         )
@@ -1643,7 +1643,7 @@ class MusicControls(discord.ui.View):
             return
         view = HistoryView(self.cog, self.guild_id, interaction.user.id, state.history)
         await interaction.response.send_message(
-            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elegí una:",
+            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elige una:",
             view=view,
             ephemeral=True,
         )
@@ -1700,7 +1700,7 @@ class SearchResultsView(discord.ui.View):
             desc = format_duration(duration) if duration else "Duración desconocida"
             options.append(discord.SelectOption(label=title, description=desc, value=str(i)))
 
-        self.select = discord.ui.Select(placeholder="Elegí un resultado...", options=options)
+        self.select = discord.ui.Select(placeholder="Elige un resultado...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
 
@@ -1766,14 +1766,14 @@ class HistoryView(discord.ui.View):
             desc = format_duration(song.duration) if song.duration else "Duración desconocida"
             options.append(discord.SelectOption(label=title, description=desc, value=str(i)))
 
-        self.select = discord.ui.Select(placeholder="Elegí una canción del historial...", options=options)
+        self.select = discord.ui.Select(placeholder="Elige una canción del historial...", options=options)
         self.select.callback = self.on_select
         self.add_item(self.select)
 
     async def on_select(self, interaction: discord.Interaction):
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "Solo quien pidió el historial puede elegir acá.", ephemeral=True
+                "Solo quien pidió el historial puede elegir aquí.", ephemeral=True
             )
             return
 
@@ -1962,7 +1962,7 @@ class GuildMusicState:
                 log.exception("No se pudo lanzar el pipeline de audio")
                 if preparing_msg:
                     await preparing_msg.edit(
-                        content=f"⚠️ No se pudo preparar **{self.current.title}**, la salteo."
+                        content=f"⚠️ No se pudo preparar **{self.current.title}**, la salto."
                     )
                 continue
 
@@ -2114,7 +2114,7 @@ class Music(commands.Cog):
         uploader: Optional[str] = None,
     ) -> tuple[Optional[Song], str]:
         if member.voice is None or member.voice.channel is None:
-            return None, "Tenés que estar en un canal de voz primero."
+            return None, "Tienes que estar en un canal de voz primero."
 
         state = self.get_state(guild.id)
         state.text_channel = text_channel
@@ -2173,7 +2173,7 @@ class Music(commands.Cog):
             return
 
         if ctx.author.voice is None or ctx.author.voice.channel is None:
-            await ctx.respond("Tenés que estar en un canal de voz primero.")
+            await ctx.respond("Tienes que estar en un canal de voz primero.")
             return
 
         await ctx.defer()
@@ -2183,7 +2183,7 @@ class Music(commands.Cog):
             tracks = await loop.run_in_executor(None, fetch_spotify_tracks, kind, item_id)
         except Exception:
             log.exception("Error consultando Spotify")
-            await ctx.respond("No pude leer ese link de Spotify. Revisá que sea público y válido.")
+            await ctx.respond("No pude leer ese link de Spotify. Revisa que sea público y válido.")
             return
 
         if not tracks:
@@ -2247,11 +2247,11 @@ class Music(commands.Cog):
             summary += f" No pude encontrar {failed} en YouTube."
         await ctx.channel.send(summary)
 
-    @commands.slash_command(name="play", description="Reproduce audio desde un link de YouTube/YT Music/Spotify, o buscá por nombre")
+    @commands.slash_command(name="play", description="Reproduce audio desde un link de YouTube/YT Music/Spotify, o busca por nombre")
     async def play(
         self,
         ctx: discord.ApplicationContext,
-        query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que querés buscar"),
+        query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que quieres buscar"),
     ):
         # 1. Manejo de Spotify
         spotify_match = parse_spotify_url(query) if "open.spotify.com" in query else None
@@ -2308,7 +2308,7 @@ class Music(commands.Cog):
                         state = self.get_state(ctx.guild.id)
 
                         if ctx.author.voice is None or ctx.author.voice.channel is None:
-                            await self._safe_respond(ctx, "Tenés que estar en un canal de voz primero.")
+                            await self._safe_respond(ctx, "Tienes que estar en un canal de voz primero.")
                             return
 
                         voice_channel = ctx.author.voice.channel
@@ -2354,7 +2354,7 @@ class Music(commands.Cog):
                     ctx,
                     f"🎶 Playlist cargada en segundo plano: **{playlist_state['title']}** "
                     f"({len(playlist_state['entries'])} canciones).\n"
-                    f"*(Se irá añadiendo de a una. Si piden una canción suelta, se tocará primero y luego se retomará la lista).*"
+                    f"*(Se irá añadiendo una por una. Si piden una canción suelta, se tocará primero y luego se retomará la lista).*"
                 )
                 return
 
@@ -2385,7 +2385,7 @@ class Music(commands.Cog):
             results = await self._search(query)
         except Exception:
             log.exception("Error buscando en YouTube")
-            await ctx.respond("No pude buscar eso, intentá de nuevo.")
+            await ctx.respond("No pude buscar eso, intenta de nuevo.")
             return
 
         if not results:
@@ -2393,7 +2393,7 @@ class Music(commands.Cog):
             return
 
         view = SearchResultsView(self, ctx.guild, ctx.author, ctx.channel, results)
-        await ctx.respond(f"Resultados para **{query}**, elegí uno:", view=view)    
+        await ctx.respond(f"Resultados para **{query}**, elige uno:", view=view)    
 
     async def send_lyrics(
         self,
@@ -2416,14 +2416,14 @@ class Music(commands.Cog):
             log.exception(f"Error buscando letra de: {raw_title!r}")
             await send(
                 "No pude buscar la letra ahora mismo (falló la búsqueda). "
-                "Probá de nuevo en un rato."
+                "Prueba de nuevo en un rato."
             )
             return
 
         if result["status"] == "not_found":
             await send(
                 f"No encontré la letra de **{raw_title}**.\n"
-                f"Probá con `/lyrics artista - canción` escribiendo el nombre exacto."
+                f"Prueba con `/lyrics artista - canción` escribiendo el nombre exacto."
             )
             return
 
@@ -2431,7 +2431,7 @@ class Music(commands.Cog):
             await send(
                 content=(
                     f"🤔 No estoy seguro de cuál es la letra de **{raw_title}**: "
-                    f"hay varias canciones parecidas. Elegí la correcta 👇"
+                    f"hay varias canciones parecidas. Elige la correcta 👇"
                 ),
                 view=LyricsPickerView(result["candidates"], song_key),
             )
@@ -2455,7 +2455,7 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         busqueda: Option(
             str,
-            "Artista y canción (si lo dejás vacío, usa la que está sonando)",
+            "Artista y canción (si lo dejas vacío, usa la que está sonando)",
             required=False,
         ) = None,
     ):
@@ -2471,7 +2471,7 @@ class Music(commands.Cog):
             state = self.get_state(ctx.guild.id)
             if not state.current:
                 await ctx.respond(
-                    "No hay nada sonando. Pasame el nombre: `/lyrics artista - canción`.",
+                    "No hay nada sonando. Pásame el nombre: `/lyrics artista - canción`.",
                     ephemeral=True,
                 )
                 return
@@ -2605,7 +2605,7 @@ class Music(commands.Cog):
             return
         view = HistoryView(self, ctx.guild.id, ctx.author.id, state.history)
         await ctx.respond(
-            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elegí una:", view=view
+            f"🕘 Últimas {len(view.entries)} canciones de esta sesión, elige una:", view=view
         )
 
     @commands.Cog.listener()
