@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ventana de control de Chiwiro Music.
+"""Ventana de control de Chiwiro Music ✿ tema Cinnamoroll.
 
 Arranca bot.py como un proceso aparte y muestra su estado y su log en vivo.
 Se abre con pythonw.exe, así que no aparece ninguna consola negra.
@@ -10,29 +10,42 @@ import os
 import queue
 import signal
 import subprocess
-import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
 
+from PIL import Image, ImageTk
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = os.path.join(BASE, "venv", "Scripts", "python.exe")
 BOT = os.path.join(BASE, "bot.py")
 ICONO = os.path.join(BASE, "chiwiro.ico")
+ICONO_GRANDE = os.path.join(BASE, "icons8-rollo-de-canela-100.ico")
 ENV = os.path.join(BASE, ".env")
 
 MAX_LINEAS_LOG = 600
 
-# Paleta parecida a la de Discord, para que combine con lo que el bot hace.
-FONDO = "#1e1f22"
-PANEL = "#2b2d31"
-TEXTO = "#dbdee1"
-TENUE = "#949ba4"
-ACENTO = "#5865f2"
-VERDE = "#23a55a"
-ROJO = "#f23f43"
-AMARILLO = "#f0b232"
+# ---------------------------------------------------------------- paleta
+# Sacada del propio icono (malva y crema) y del celeste de Cinnamoroll.
+CIELO = "#eef4fc"        # fondo general, celeste muy suave
+NUBE = "#ffffff"         # paneles
+MALVA = "#8d6c9f"        # el trazo del icono
+MALVA_CLARO = "#b79ac7"
+MALVA_SUAVE = "#f0e9f5"
+CREMA = "#f9eede"        # el relleno del icono
+ROSA = "#f6bbd0"
+ROSA_SUAVE = "#fdeef4"
+CELESTE = "#a9cff0"
+CELESTE_SUAVE = "#e6f1fb"
+TEXTO = "#6b5b7b"
+TENUE = "#a99bb5"
+MENTA = "#7fc4a3"
+MENTA_SUAVE = "#e6f6ee"
+CORAL = "#e89b9b"
+CORAL_SUAVE = "#fdeeee"
+MIEL = "#e0b57c"
+MIEL_SUAVE = "#fbf1e3"
 
 
 def token_configurado() -> bool:
@@ -48,6 +61,65 @@ def token_configurado() -> bool:
     return False
 
 
+def redondeado(canvas, x0, y0, x1, y1, radio, **kwargs):
+    """Dibuja un rectángulo de esquinas redondeadas como polígono suavizado."""
+    puntos = [
+        x0 + radio, y0, x1 - radio, y0, x1, y0, x1, y0 + radio,
+        x1, y1 - radio, x1, y1, x1 - radio, y1, x0 + radio, y1,
+        x0, y1, x0, y1 - radio, x0, y0 + radio, x0, y0,
+    ]
+    return canvas.create_polygon(puntos, smooth=True, **kwargs)
+
+
+class BotonBonito(tk.Canvas):
+    """Botón redondeado con estados de hover, porque el tk.Button normal es
+    un rectángulo gris que rompe todo el tema."""
+
+    def __init__(self, padre, texto, comando, fondo, texto_color,
+                 fondo_hover=None, ancho=None, fuente=None, **kw):
+        self.fuente = fuente or tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        ancho = ancho or self.fuente.measure(texto) + 38
+        super().__init__(padre, width=ancho, height=38, bg=CIELO,
+                         highlightthickness=0, bd=0, cursor="hand2", **kw)
+        self.comando = comando
+        self.fondo = fondo
+        self.fondo_hover = fondo_hover or fondo
+        self.texto_color = texto_color
+        self.habilitado = True
+
+        self.forma = redondeado(self, 1, 1, ancho - 1, 37, 15, fill=fondo, outline="")
+        self.etiqueta = self.create_text(ancho / 2, 19, text=texto,
+                                         fill=texto_color, font=self.fuente)
+
+        self.bind("<Enter>", self._entrar)
+        self.bind("<Leave>", self._salir)
+        self.bind("<Button-1>", self._click)
+
+    def _entrar(self, _=None):
+        if self.habilitado:
+            self.itemconfigure(self.forma, fill=self.fondo_hover)
+
+    def _salir(self, _=None):
+        if self.habilitado:
+            self.itemconfigure(self.forma, fill=self.fondo)
+
+    def _click(self, _=None):
+        if self.habilitado and self.comando:
+            self.comando()
+
+    def configurar(self, texto=None, fondo=None, texto_color=None, fondo_hover=None):
+        if texto is not None:
+            self.itemconfigure(self.etiqueta, text=texto)
+        if fondo is not None:
+            self.fondo = fondo
+            self.itemconfigure(self.forma, fill=fondo)
+        if fondo_hover is not None:
+            self.fondo_hover = fondo_hover
+        if texto_color is not None:
+            self.texto_color = texto_color
+            self.itemconfigure(self.etiqueta, fill=texto_color)
+
+
 class ChiwiroApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -56,9 +128,9 @@ class ChiwiroApp:
         self.lineas = 0
 
         root.title("Chiwiro Music")
-        root.configure(bg=FONDO)
-        root.geometry("640x470")
-        root.minsize(520, 360)
+        root.configure(bg=CIELO)
+        root.geometry("660x520")
+        root.minsize(560, 420)
         if os.path.exists(ICONO):
             try:
                 root.iconbitmap(default=ICONO)
@@ -66,70 +138,181 @@ class ChiwiroApp:
                 pass
         root.protocol("WM_DELETE_WINDOW", self.al_cerrar)
 
+        self._estado_texto = "durmiendo~"
+        self._estado_color = TENUE
+        self._estado_fondo = MALVA_SUAVE
+        self._estado_detalle = ""
+
+        self._cargar_fuentes()
         self._construir_interfaz()
         self._revisar_cola()
 
-        # "Abrirla y que se ejecute todo": arranca solo al abrir la ventana.
-        root.after(300, self.iniciar)
+        # "Abrirla y que se ejecute todo": arranca sola al abrir la ventana.
+        root.after(400, self.iniciar)
 
     # ------------------------------------------------------------------ UI
 
+    def _cargar_fuentes(self):
+        familias = set(tkfont.families())
+
+        def elegir(*opciones):
+            for o in opciones:
+                if o in familias:
+                    return o
+            return "Segoe UI"
+
+        titulo = elegir("Ink Free", "Comic Sans MS", "Segoe UI")
+        cuerpo = elegir("Segoe UI", "Candara")
+
+        self.f_titulo = tkfont.Font(family=titulo, size=22)
+        self.f_sub = tkfont.Font(family=cuerpo, size=9)
+        self.f_estado = tkfont.Font(family=cuerpo, size=10, weight="bold")
+        self.f_boton = tkfont.Font(family=cuerpo, size=10, weight="bold")
+        self.f_log = tkfont.Font(family=cuerpo, size=9)
+        self.f_hora = tkfont.Font(family=elegir("Consolas", "Courier New"), size=8)
+
     def _construir_interfaz(self):
-        fuente_ui = tkfont.Font(family="Segoe UI", size=10)
-        fuente_estado = tkfont.Font(family="Segoe UI", size=12, weight="bold")
-        fuente_log = tkfont.Font(family="Consolas", size=9)
+        # ---------------------------------------------------- encabezado
+        self.cabecera = tk.Canvas(self.root, bg=CIELO, height=118,
+                                  highlightthickness=0, bd=0)
+        self.cabecera.pack(fill="x")
+        self.cabecera.bind("<Configure>", self._dibujar_cabecera)
 
-        cabecera = tk.Frame(self.root, bg=PANEL, padx=14, pady=12)
-        cabecera.pack(fill="x")
+        try:
+            imagen = Image.open(ICONO_GRANDE).convert("RGBA").resize((72, 72), Image.LANCZOS)
+            self.icono_tk = ImageTk.PhotoImage(imagen)
+        except Exception:
+            self.icono_tk = None
 
-        self.punto = tk.Label(cabecera, text="●", font=fuente_estado, bg=PANEL, fg=TENUE)
-        self.punto.pack(side="left")
-        self.estado = tk.Label(
-            cabecera, text="  Detenido", font=fuente_estado, bg=PANEL, fg=TEXTO
-        )
-        self.estado.pack(side="left")
+        # ------------------------------------------------------- botones
+        botones = tk.Frame(self.root, bg=CIELO)
+        botones.pack(fill="x", padx=22, pady=(2, 12))
 
-        self.detalle = tk.Label(cabecera, text="", font=fuente_ui, bg=PANEL, fg=TENUE)
-        self.detalle.pack(side="right")
-
-        botones = tk.Frame(self.root, bg=FONDO, padx=14, pady=12)
-        botones.pack(fill="x")
-
-        self.boton_encendido = self._boton(botones, "▶  Iniciar", self.alternar, ACENTO)
+        # Solo usamos glifos que Segoe UI dibuja bien (♪ ■ ♡). El resto va
+        # con palabras: un glifo que el sistema no tiene se ve como cuadrito
+        # y arruina más de lo que decora.
+        self.boton_encendido = BotonBonito(
+            botones, "♪   Iniciar", self.alternar, MALVA, "#ffffff",
+            fondo_hover=MALVA_CLARO, ancho=140, fuente=self.f_boton)
         self.boton_encendido.pack(side="left")
-        self._boton(botones, "⚙  Configurar", self.abrir_env, PANEL).pack(side="left", padx=(8, 0))
-        self._boton(botones, "📋  Copiar log", self.copiar_log, PANEL).pack(side="left", padx=(8, 0))
-        self._boton(botones, "🗕  Ocultar", self.root.iconify, PANEL).pack(side="right")
 
-        contenedor = tk.Frame(self.root, bg=FONDO)
-        contenedor.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        BotonBonito(botones, "Configurar", self.abrir_env, CREMA, MALVA,
+                    fondo_hover="#f3e3cd", fuente=self.f_boton).pack(side="left", padx=(10, 0))
+        BotonBonito(botones, "Copiar log", self.copiar_log, CELESTE_SUAVE, "#5b87ad",
+                    fondo_hover=CELESTE, fuente=self.f_boton).pack(side="left", padx=(10, 0))
+        BotonBonito(botones, "Ocultar", self.root.iconify, ROSA_SUAVE, "#c4718f",
+                    fondo_hover=ROSA, fuente=self.f_boton).pack(side="right")
 
+        # ----------------------------------------------------------- log
+        envoltorio = tk.Frame(self.root, bg=CIELO)
+        envoltorio.pack(fill="both", expand=True, padx=22, pady=(0, 20))
+
+        self.fondo_log = tk.Canvas(envoltorio, bg=CIELO, highlightthickness=0, bd=0)
+        self.fondo_log.pack(fill="both", expand=True)
+        self.fondo_log.bind("<Configure>", self._dibujar_fondo_log)
+
+        contenido = tk.Frame(self.fondo_log, bg=NUBE)
         self.log = tk.Text(
-            contenedor, bg="#111214", fg=TEXTO, font=fuente_log, wrap="word",
-            relief="flat", padx=10, pady=8, insertbackground=TEXTO, state="disabled",
+            contenido, bg=NUBE, fg=TEXTO, font=self.f_log, wrap="word",
+            relief="flat", padx=6, pady=4, insertbackground=TEXTO,
+            state="disabled", borderwidth=0, highlightthickness=0,
+            spacing1=2, spacing3=2, cursor="arrow",
         )
-        barra = tk.Scrollbar(contenedor, command=self.log.yview, bg=PANEL)
-        self.log.configure(yscrollcommand=barra.set)
-        barra.pack(side="right", fill="y")
+        self.barra = tk.Scrollbar(contenido, command=self.log.yview,
+                                  bg=NUBE, troughcolor=MALVA_SUAVE,
+                                  activebackground=MALVA_CLARO, relief="flat",
+                                  borderwidth=0, width=10)
+        self.log.configure(yscrollcommand=self._ajustar_barra)
+        self.barra.pack(side="right", fill="y", pady=6)
         self.log.pack(side="left", fill="both", expand=True)
+        self.ventana_log = self.fondo_log.create_window(0, 0, window=contenido, anchor="nw")
 
-        self.log.tag_configure("hora", foreground=TENUE)
-        self.log.tag_configure("error", foreground=ROJO)
-        self.log.tag_configure("aviso", foreground=AMARILLO)
-        self.log.tag_configure("ok", foreground=VERDE)
+        self.log.tag_configure("hora", foreground=TENUE, font=self.f_hora)
+        self.log.tag_configure("normal", foreground=TEXTO)
+        self.log.tag_configure("ok", foreground="#4f9b7a")
+        self.log.tag_configure("aviso", foreground="#b98533")
+        self.log.tag_configure("error", foreground="#c96f6f")
 
-    def _boton(self, padre, texto, comando, color):
-        return tk.Button(
-            padre, text=texto, command=comando, bg=color, fg=TEXTO,
-            activebackground=color, activeforeground=TEXTO, relief="flat",
-            font=tkfont.Font(family="Segoe UI", size=10), padx=14, pady=6,
-            cursor="hand2", borderwidth=0,
-        )
+    def _dibujar_cabecera(self, evento=None):
+        c = self.cabecera
+        ancho = evento.width if evento else c.winfo_width()
+        c.delete("all")
 
-    def escribir(self, texto, etiqueta=None):
+        # Nubecitas de fondo, para que no sea un rectángulo plano.
+        for cx, cy, escala, color in [
+            (ancho - 70, 26, 1.15, "#e2edfa"), (ancho - 140, 62, 0.8, "#e8f1fb"),
+            (ancho - 200, 22, 0.6, "#eaf2fc"),
+        ]:
+            self._nube(c, cx, cy, escala, color)
+
+        # Tarjeta blanca
+        redondeado(c, 22, 10, max(ancho - 22, 200), 104, 24, fill=NUBE, outline="")
+
+        if self.icono_tk is not None:
+            c.create_image(44, 57, image=self.icono_tk, anchor="w")
+
+        c.create_text(130, 42, text="Chiwiro Music", anchor="w",
+                      fill=MALVA, font=self.f_titulo)
+        c.create_text(132, 70, text="✿  tu bot de música en Discord", anchor="w",
+                      fill=TENUE, font=self.f_sub)
+
+        # Pastilla de estado
+        self._dibujar_pastilla(ancho)
+
+    def _nube(self, canvas, cx, cy, escala, color):
+        for dx, dy, r in [(-16, 4, 13), (0, -2, 18), (17, 5, 12), (0, 10, 15)]:
+            canvas.create_oval(
+                cx + (dx - r) * escala, cy + (dy - r) * escala,
+                cx + (dx + r) * escala, cy + (dy + r) * escala,
+                fill=color, outline="")
+
+    def _dibujar_pastilla(self, ancho=None):
+        c = self.cabecera
+        ancho = ancho or c.winfo_width()
+        c.delete("pastilla")
+
+        texto = getattr(self, "_estado_texto", "durmiendo~")
+        color = getattr(self, "_estado_color", TENUE)
+        fondo = getattr(self, "_estado_fondo", MALVA_SUAVE)
+        detalle = getattr(self, "_estado_detalle", "")
+
+        ancho_texto = self.f_estado.measure(texto)
+        x1 = ancho - 40
+        x0 = x1 - ancho_texto - 44
+        redondeado(c, x0, 30, x1, 60, 15, fill=fondo, outline="", tags="pastilla")
+        c.create_oval(x0 + 15, 41, x0 + 25, 51, fill=color, outline="", tags="pastilla")
+        c.create_text(x0 + 32, 45, text=texto, anchor="w", fill=color,
+                      font=self.f_estado, tags="pastilla")
+        if detalle:
+            c.create_text(x1, 74, text=detalle[:46], anchor="e", fill=TENUE,
+                          font=self.f_sub, tags="pastilla")
+
+    def _ajustar_barra(self, primero, ultimo):
+        """Esconde la barra de scroll mientras no haya nada que scrollear:
+        la barra nativa de Windows es gris y se pelea con el tema."""
+        if float(primero) <= 0.0 and float(ultimo) >= 1.0:
+            self.barra.pack_forget()
+        elif not self.barra.winfo_ismapped():
+            self.barra.pack(side="right", fill="y", pady=6, before=self.log)
+        self.barra.set(primero, ultimo)
+
+    def _dibujar_fondo_log(self, evento=None):
+        c = self.fondo_log
+        ancho = evento.width if evento else c.winfo_width()
+        alto = evento.height if evento else c.winfo_height()
+        c.delete("fondo")
+        redondeado(c, 0, 0, ancho, alto, 22, fill=NUBE, outline="", tags="fondo")
+        c.tag_lower("fondo")
+        c.coords(self.ventana_log, 16, 18)
+        c.itemconfigure(self.ventana_log, width=max(ancho - 32, 50),
+                        height=max(alto - 34, 50))
+
+    def escribir(self, texto, etiqueta="normal", adorno=None):
+        adornos = {"ok": "♡ ", "aviso": "! ", "error": "✖ ", "normal": ""}
         self.log.configure(state="normal")
         self.log.insert("end", time.strftime("%H:%M  "), "hora")
-        self.log.insert("end", texto.rstrip() + "\n", etiqueta or ())
+        self.log.insert("end", (adorno or adornos.get(etiqueta, "")) + texto.rstrip() + "\n",
+                        etiqueta)
         self.lineas += 1
         if self.lineas > MAX_LINEAS_LOG:
             self.log.delete("1.0", f"{self.lineas - MAX_LINEAS_LOG + 1}.0")
@@ -137,10 +320,12 @@ class ChiwiroApp:
         self.log.configure(state="disabled")
         self.log.see("end")
 
-    def _poner_estado(self, texto, color, detalle=""):
-        self.punto.configure(fg=color)
-        self.estado.configure(text=f"  {texto}")
-        self.detalle.configure(text=detalle)
+    def _poner_estado(self, texto, color, fondo, detalle=""):
+        self._estado_texto = texto
+        self._estado_color = color
+        self._estado_fondo = fondo
+        self._estado_detalle = detalle
+        self._dibujar_pastilla()
 
     # -------------------------------------------------------------- proceso
 
@@ -156,26 +341,18 @@ class ChiwiroApp:
             return
 
         if not os.path.exists(PYTHON):
-            self.escribir(
-                "No encontré el entorno virtual (venv). Abre una terminal en esta "
-                "carpeta y ejecuta:  python -m venv venv", "error"
-            )
-            self.escribir(
-                "Después:  venv\\Scripts\\pip install -r requirements.txt", "error"
-            )
+            self.escribir("No encontré el entorno virtual (venv). Abre una terminal "
+                          "en esta carpeta y ejecuta:  python -m venv venv", "error")
+            self.escribir("Después:  venv\\Scripts\\pip install -r requirements.txt", "error")
             return
 
         if not token_configurado():
-            self._poner_estado("Falta configurar", AMARILLO)
+            self._poner_estado("falta el token", "#b98533", MIEL_SUAVE)
             self.escribir("El archivo .env no tiene el token del bot.", "aviso")
-            self.escribir(
-                'Haz clic en "⚙ Configurar", pega el token en DISCORD_TOKEN=, guarda '
-                "y vuelve a darle a Iniciar.", "aviso"
-            )
-            self.escribir(
-                "El token se saca de discord.com/developers/applications → tu app "
-                "→ Bot → Reset Token.", "aviso"
-            )
+            self.escribir('Haz clic en "✎ Configurar", pega el token en DISCORD_TOKEN=, '
+                          "guarda y vuelve a darle a Iniciar.", "aviso")
+            self.escribir("El token se saca de discord.com/developers/applications "
+                          "→ tu app → Bot → Reset Token.", "aviso")
             return
 
         entorno = dict(os.environ)
@@ -204,8 +381,9 @@ class ChiwiroApp:
 
         threading.Thread(target=self._leer_salida, args=(self.proceso,), daemon=True).start()
 
-        self._poner_estado("Conectando...", AMARILLO)
-        self.boton_encendido.configure(text="⏹  Detener", bg=ROJO)
+        self._poner_estado("despertando...", "#b98533", MIEL_SUAVE)
+        self.boton_encendido.configurar(texto="■   Detener", fondo=ROSA,
+                                        fondo_hover="#f3a8c2", texto_color="#8a4a63")
         self.escribir("Arrancando el bot...", "ok")
 
     def _leer_salida(self, proceso):
@@ -244,48 +422,62 @@ class ChiwiroApp:
             pass
         self.root.after(120, self._revisar_cola)
 
+    @staticmethod
+    def _es_ruido(linea: str) -> bool:
+        """discord.py loguea en INFO el payload entero del gateway (un JSON
+        gigante con métricas internas). No aporta nada y tapa el resto, así
+        que escondemos lo que sea INFO de los loggers de discord.*. Los
+        avisos y errores de esos mismos loggers sí se muestran."""
+        if "[INFO]" not in linea:
+            return False
+        resto = linea.split("[INFO]", 1)[1].strip()
+        return resto.split(":", 1)[0].strip().startswith("discord.")
+
     def _procesar_linea(self, linea):
         limpia = linea.rstrip()
-        if not limpia:
+        if not limpia or self._es_ruido(limpia):
             return
 
-        etiqueta = None
-        if "[ERROR]" in limpia or "Traceback" in limpia or "Error" in limpia:
+        etiqueta = "normal"
+        if "[ERROR]" in limpia or "Traceback" in limpia:
             etiqueta = "error"
         elif "[WARNING]" in limpia:
             etiqueta = "aviso"
 
         if "Conectado como" in limpia:
             nombre = limpia.split("Conectado como", 1)[1].split("(id=")[0].strip()
-            self._poner_estado("En línea", VERDE, nombre)
+            self._poner_estado("en línea ♡", "#4f9b7a", MENTA_SUAVE, nombre)
             etiqueta = "ok"
         elif "Servidores:" in limpia:
-            servidores = limpia.split("Servidores:", 1)[1].strip()
-            self.detalle.configure(text=servidores[:60])
+            self._estado_detalle = limpia.split("Servidores:", 1)[1].strip()
+            self._dibujar_pastilla()
         elif "No se encontró DISCORD_TOKEN" in limpia:
-            self._poner_estado("Falta configurar", AMARILLO)
+            self._poner_estado("falta el token", "#b98533", MIEL_SUAVE)
             etiqueta = "error"
 
-        # Le sacamos el prefijo del logging, que en una ventana propia sobra.
+        # Le sacamos el prefijo del logging (fecha, nivel y nombre del
+        # logger), que en una ventana propia sobra.
         for marca in ("[INFO] ", "[WARNING] ", "[ERROR] "):
             if marca in limpia:
                 limpia = limpia.split(marca, 1)[1]
+                nombre, sep, mensaje = limpia.partition(": ")
+                if sep and " " not in nombre:
+                    limpia = mensaje
                 break
 
         self.escribir(limpia, etiqueta)
 
     def _proceso_termino(self, codigo):
         self.proceso = None
-        self.boton_encendido.configure(text="▶  Iniciar", bg=ACENTO)
+        self.boton_encendido.configurar(texto="♪   Iniciar", fondo=MALVA,
+                                        fondo_hover=MALVA_CLARO, texto_color="#ffffff")
         if codigo == 0:
-            self._poner_estado("Detenido", TENUE)
-            self.escribir("El bot se detuvo.", "aviso")
+            self._poner_estado("durmiendo~", TENUE, MALVA_SUAVE)
+            self.escribir("El bot se detuvo. ¡Hasta la próxima!", "aviso")
         else:
-            self._poner_estado("Se cerró con error", ROJO)
-            self.escribir(
-                f"El bot se cerró con código {codigo}. Mira el log de arriba "
-                f"para ver qué pasó.", "error"
-            )
+            self._poner_estado("se cayó :(", "#c96f6f", CORAL_SUAVE)
+            self.escribir(f"El bot se cerró con código {codigo}. Mira el log de "
+                          f"arriba para ver qué pasó.", "error")
 
     def abrir_env(self):
         if not os.path.exists(ENV):
@@ -313,7 +505,7 @@ class ChiwiroApp:
 
 def main():
     # Para que Windows agrupe la ventana con el acceso directo anclado y le
-    # ponga nuestro ícono en la barra de tareas.
+    # ponga nuestro icono en la barra de tareas.
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Chiwiro.Music.Bot")

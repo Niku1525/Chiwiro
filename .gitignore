@@ -13,3 +13,6 @@ __pycache__/
 # Entornos virtuales (si usas uno)
 venv/
 .venv/
+
+# Accesos directos: apuntan a rutas de esta maquina, no sirven en otra
+*.lnk
