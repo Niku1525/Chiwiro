@@ -63,6 +63,12 @@ MAX_BUFFER_BYTES = int(os.getenv("MAX_BUFFER_BYTES", str(500 * 1024 * 1024)))
 
 AUTO_DISCONNECT_SECONDS = float(os.getenv("AUTO_DISCONNECT_SECONDS", "120"))
 
+# Cada cuánto se redibuja la barra de progreso del mensaje "Reproduciendo
+# ahora". Editar un mensaje es una llamada a la API de Discord, y hacerlo
+# cada 5 segundos alcanzaba para que nos limitaran. Con 15 la barra sigue
+# viéndose viva y gastamos un tercio de las llamadas.
+PROGRESS_UPDATE_SECONDS = float(os.getenv("PROGRESS_UPDATE_SECONDS", "15"))
+
 MAX_HISTORY = 100
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
@@ -1845,18 +1851,32 @@ class GuildMusicState:
         return max(0.0, now - self.playback_started_at - self.total_paused_seconds - paused_extra)
 
     async def _update_progress_loop(self):
+        # Guardamos lo último que mandamos para no repetir la misma edición.
+        # Sin esto, con la canción en pausa el reloj queda congelado y el bot
+        # reeditaba el mismo mensaje con el mismo texto cada 5 segundos para
+        # siempre, y Discord terminaba limitándonos ("We are being rate
+        # limited" sobre /channels/.../messages/...).
+        ultimo = None
         try:
             while True:
-                await asyncio.sleep(5)
+                await asyncio.sleep(PROGRESS_UPDATE_SECONDS)
                 if not self.now_playing_msg or not self.current:
                     return
                 if not (self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())):
                     return
-                embed = build_now_playing_embed(self.current, self.get_elapsed(), self.loop_mode)
+
+                elapsed = self.get_elapsed()
+                firma = (self.current.webpage_url, self.loop_mode,
+                         build_progress_bar(elapsed, self.current.duration))
+                if firma == ultimo:
+                    continue
+
+                embed = build_now_playing_embed(self.current, elapsed, self.loop_mode)
                 try:
                     await self.now_playing_msg.edit(embed=embed)
                 except discord.HTTPException:
                     return
+                ultimo = firma
         except asyncio.CancelledError:
             pass
 
