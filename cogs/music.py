@@ -74,6 +74,7 @@ KARAOKE_UPDATE_SECONDS = float(os.getenv("KARAOKE_UPDATE_SECONDS", "2"))
 MAX_HISTORY = 100
 
 RADIO_SIZE = int(os.getenv("RADIO_SIZE", "30"))
+RADIO_COOLDOWN_SECONDS = float(os.getenv("RADIO_COOLDOWN_SECONDS", "50"))
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
@@ -1836,6 +1837,7 @@ class GuildMusicState:
 
         self.autoplay: bool = get_guild_autoplay(guild_id)
         self._radio_seed: Optional[str] = None
+        self.radio_idle_since: Optional[float] = None
 
         self.pending_seek: Optional[float] = None
         self.seek_offset: float = 0.0
@@ -1906,6 +1908,16 @@ class GuildMusicState:
         except asyncio.CancelledError:
             pass
 
+
+    def _radio_due(self) -> bool:
+        if self.queue or self.active_playlist or not self.autoplay:
+            self.radio_idle_since = None
+            return False
+        now = time.monotonic()
+        if self.radio_idle_since is None:
+            self.radio_idle_since = now
+            return False
+        return now - self.radio_idle_since >= RADIO_COOLDOWN_SECONDS
 
     async def _start_radio(self) -> bool:
         last_track = self.history[-1] if self.history else self.current
@@ -2016,7 +2028,7 @@ class GuildMusicState:
                 await asyncio.sleep(1)
                 continue
 
-            if not self.queue and not self.active_playlist and self.autoplay:
+            if self._radio_due():
                 await self._start_radio()
 
             if not self.queue and self.active_playlist:
