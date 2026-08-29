@@ -2016,6 +2016,9 @@ class GuildMusicState:
                 await asyncio.sleep(1)
                 continue
 
+            if not self.queue and not self.active_playlist and self.autoplay:
+                await self._start_radio()
+
             if not self.queue and self.active_playlist:
                 pl = self.active_playlist
                 while pl["current_index"] < len(pl["entries"]):
@@ -2063,9 +2066,6 @@ class GuildMusicState:
 
                 if pl["current_index"] >= len(pl["entries"]):
                     self.active_playlist = None
-
-            if not self.queue and not self.active_playlist and self.autoplay:
-                await self._start_radio()
 
             try:
                 self.current = self.queue.popleft()
