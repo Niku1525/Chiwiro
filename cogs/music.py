@@ -1110,6 +1110,10 @@ class Song:
     # Canal de YouTube (o artista, si yt-dlp lo trae). Se usa como pista
     # para buscar la letra correcta.
     uploader: Optional[str] = None
+    # ID de quien la pidió, para las estadísticas: agrupa aunque la persona
+    # se cambie el apodo. Va en None cuando la puso la radio, y así esas
+    # canciones no ensucian el ranking de personas.
+    requester_id: Optional[int] = None
 
 
 def build_now_playing_embed(song: Song, elapsed: float, loop_mode: str) -> discord.Embed:
@@ -1527,6 +1531,7 @@ class FavoriteSelectView(discord.ui.View):
                 requester=interaction.user.display_name,
                 thumbnail=entry.get("thumbnail"),
                 uploader=entry.get("uploader"),
+                requester_id=interaction.user.id,
             )
             state.queue.append(song)
 
@@ -2198,6 +2203,7 @@ class GuildMusicState:
                         requester=f"{pl['requester']}",
                         thumbnail=pick_thumbnail(entry),
                         uploader=entry.get("uploader") or entry.get("channel"),
+                        requester_id=pl.get("requester_id"),
                     )
                     self.queue.append(song) # Metemos solo la que sigue y rompemos el ciclo
                     break
@@ -2300,7 +2306,8 @@ class GuildMusicState:
                 self.history = self.history[-MAX_HISTORY:]
 
             stats.registrar(self.guild_id, self.current.title,
-                                   self.current.webpage_url, self.current.requester)
+                            self.current.webpage_url, self.current.requester,
+                            self.current.requester_id)
             await self.actualizar_presencia(self.current)
 
         embed = build_now_playing_embed(self.current, inicio, self.loop_mode)
@@ -2455,6 +2462,7 @@ class Music(commands.Cog):
             requester=member.display_name,
             thumbnail=thumbnail,
             uploader=uploader,
+            requester_id=member.id,
         )
         was_playing = state.current is not None
         state.queue.append(song)
@@ -2650,7 +2658,8 @@ class Music(commands.Cog):
                             "title": info.get("title", "Lista de reproducción"),
                             "entries": entries,
                             "current_index": start_index,
-                            "requester": ctx.author.display_name
+                            "requester": ctx.author.display_name,
+                            "requester_id": ctx.author.id
                         }
                         playlist_ready = True
                         playlist_state = state.active_playlist
