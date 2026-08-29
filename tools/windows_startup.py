@@ -28,7 +28,7 @@ from win32com.propsys import propsys, pscon
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHONW = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
-ICONO = os.path.join(BASE, "chiwiro.ico")
+ICONO = os.path.join(BASE, "assets", "chiwiro.ico")
 
 APP_ID = "Chiwiro.Music.Bot"
 NOMBRE = "Chiwiro Music.lnk"
@@ -54,7 +54,7 @@ def activar():
     shell = win32com.client.Dispatch("WScript.Shell")
     atajo = shell.CreateShortCut(destino)
     atajo.TargetPath = PYTHONW
-    atajo.Arguments = "chiwiro_app.py --minimizado"
+    atajo.Arguments = r"app\chiwiro_app.py --minimizado"
     atajo.WorkingDirectory = BASE
     atajo.IconLocation = f"{ICONO},0"
     atajo.Description = "Chiwiro Music - arranca con Windows"

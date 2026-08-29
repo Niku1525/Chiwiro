@@ -18,8 +18,8 @@ from win32com.propsys import propsys, pscon
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESTINO_PYTHONW = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
-GUION = "chiwiro_app.py"
-ICONO = os.path.join(BASE, "chiwiro.ico")
+GUION = r"app\chiwiro_app.py"
+ICONO = os.path.join(BASE, "assets", "chiwiro.ico")
 
 # Tiene que ser idéntico al de chiwiro_app.py
 APP_ID = "Chiwiro.Music.Bot"

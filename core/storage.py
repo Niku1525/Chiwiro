@@ -15,7 +15,9 @@ _candado = threading.Lock()
 
 
 def carpeta(nombre: str) -> str:
-    ruta = os.path.join(RAIZ, nombre)
+    """Carpeta de datos del bot. Todo lo que se genera en tiempo de
+    ejecución vive bajo data/, para no ensuciar la raíz del proyecto."""
+    ruta = os.path.join(RAIZ, "data", nombre)
     os.makedirs(ruta, exist_ok=True)
     return ruta
 

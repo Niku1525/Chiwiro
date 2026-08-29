@@ -20,8 +20,8 @@ import struct
 from PIL import Image
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ORIGEN = os.path.join(BASE, "cinnamoroll-100.ico")
-SALIDA = os.path.join(BASE, "chiwiro.ico")
+ORIGEN = os.path.join(BASE, "assets", "cinnamoroll-100.ico")
+SALIDA = os.path.join(BASE, "assets", "chiwiro.ico")
 
 TAMANOS = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
 

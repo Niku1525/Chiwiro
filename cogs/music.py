@@ -83,13 +83,13 @@ MAX_HISTORY = 100
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "guild_settings.json")
+SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "data", "guild_settings.json")
 _settings_lock = threading.Lock()
 
 # Favoritos persistentes por usuario.
 # Se guarda únicamente una URL por línea en:
 # F:\\Music_Bot\\favorites\\<user_id>.txt
-FAVORITES_DIR = os.path.join(_PROJECT_ROOT, "favorites")
+FAVORITES_DIR = os.path.join(_PROJECT_ROOT, "data", "favorites")
 os.makedirs(FAVORITES_DIR, exist_ok=True)
 _favorites_lock = threading.Lock()
 

@@ -20,13 +20,15 @@ from tkinter import font as tkfont
 import psutil
 from PIL import Image, ImageTk
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+# La app vive en app/, así que la raíz del proyecto es la carpeta de
+# arriba: de ahí cuelgan bot.py, el venv, el .env y los iconos.
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PYTHON = os.path.join(BASE, "venv", "Scripts", "python.exe")
 BOT = os.path.join(BASE, "bot.py")
-ICONO = os.path.join(BASE, "chiwiro.ico")
-ICONO_GRANDE = os.path.join(BASE, "cinnamoroll-100.ico")
+ICONO = os.path.join(BASE, "assets", "chiwiro.ico")
+ICONO_GRANDE = os.path.join(BASE, "assets", "cinnamoroll-100.ico")
 ENV = os.path.join(BASE, ".env")
-CONFIG = os.path.join(BASE, "app_config.json")
+CONFIG = os.path.join(BASE, "data", "app_config.json")
 
 # Tiene que ser idéntico al del acceso directo (ver
 # tools/create_shortcut.py) o Windows abre dos botones en la
