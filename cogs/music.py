@@ -1587,8 +1587,17 @@ class MusicControls(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild_id = guild_id
+        # El panel se crea de cero con cada canción, así que los botones que
+        # son interruptores tienen que nacer mostrando el estado real. Si no,
+        # la radio seguía encendida pero el botón decía "Off".
         state = self.cog.get_state(guild_id)
         self.loop_button.label = self.LOOP_LABELS[state.loop_mode]
+        self._pintar_radio(state.autoplay)
+
+    def _pintar_radio(self, activo: bool):
+        self.radio_button.label = f"📻 Radio: {'On' if activo else 'Off'}"
+        self.radio_button.style = (discord.ButtonStyle.success if activo
+                                   else discord.ButtonStyle.secondary)
 
     @discord.ui.button(label="⏸️ Pausar", style=discord.ButtonStyle.primary, row=0)
     async def pause_resume(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -1748,9 +1757,7 @@ class MusicControls(discord.ui.View):
                 state.active_playlist = None
             state._radio_desde = None
 
-        button.label = f"📻 Radio: {'On' if state.autoplay else 'Off'}"
-        button.style = (discord.ButtonStyle.success if state.autoplay
-                        else discord.ButtonStyle.secondary)
+        self._pintar_radio(state.autoplay)
         await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="🎤 Karaoke", style=discord.ButtonStyle.secondary, row=2)
