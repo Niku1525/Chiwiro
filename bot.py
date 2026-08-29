@@ -16,7 +16,7 @@ log = logging.getLogger("bot")
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
-intents.message_content = False  # no lo necesitamos, todo va por slash commands
+intents.message_content = False
 intents.voice_states = True
 
 bot = commands.Bot(intents=intents)

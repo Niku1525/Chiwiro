@@ -1,15 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Letras con marcas de tiempo, para el modo karaoke.
-
-Genius (que ya usa el bot para /lyrics) da la letra en texto plano, sin
-tiempos. Para saber qué verso suena en cada segundo hace falta otra fuente:
-lrclib.net, que es gratis, no pide API key y devuelve formato LRC:
-
-    [00:23.62] Ella durmió al calor de las masas
-
-Si una canción no tiene versión sincronizada, se avisa y el usuario se
-queda con /lyrics, que sigue funcionando igual.
-"""
 import difflib
 import logging
 import re
@@ -20,181 +8,156 @@ import requests
 log = logging.getLogger(__name__)
 
 API = "https://lrclib.net/api/search"
-AGENTE = "ChiwiroMusicBot/1.0 (bot de Discord de uso personal)"
+USER_AGENT = "ChiwiroMusicBot/1.0 (bot de Discord de uso personal)"
 
-# [mm:ss.xx] texto   —  los centésimos son opcionales
-_LINEA_LRC = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]\s*(.*)")
+_LRC_LINE = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]\s*(.*)")
 
-# Cuánto puede diferir la duración de lrclib de la del video de YouTube
-# para seguir considerándolo la misma grabación.
-TOLERANCIA_DURACION = 12
+DURATION_TOLERANCE = 12
 
 
-def _parsear_lrc(texto: str) -> list[tuple[float, str]]:
-    """'[00:23.62] Ella durmió...' -> [(23.62, 'Ella durmió...'), ...]"""
-    versos = []
-    for linea in texto.split("\n"):
-        coincidencia = _LINEA_LRC.match(linea.strip())
-        if not coincidencia:
+def _parse_lrc(text: str) -> list[tuple[float, str]]:
+    verses = []
+    for line in text.split("\n"):
+        found = _LRC_LINE.match(line.strip())
+        if not found:
             continue
-        minutos, segundos, fraccion, letra = coincidencia.groups()
-        tiempo = int(minutos) * 60 + int(segundos)
-        if fraccion:
-            tiempo += float(f"0.{fraccion}")
-        versos.append((tiempo, letra.strip()))
-    versos.sort(key=lambda v: v[0])
-    return versos
+        minutes, seconds, fraction, words = found.groups()
+        at = int(minutes) * 60 + int(seconds)
+        if fraction:
+            at += float(f"0.{fraction}")
+        verses.append((at, words.strip()))
+    verses.sort(key=lambda v: v[0])
+    return verses
 
 
 _FEAT = re.compile(r"\s*[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\s[^)\]]*[\)\]]?", re.IGNORECASE)
-_PARENTESIS = re.compile(r"[\(（]([^)）]+)[\)）]")
+_PARENS = re.compile(r"[\(（]([^)）]+)[\)）]")
 
 
-def _normalizar(texto: str) -> str:
-    limpio = unicodedata.normalize("NFKD", (texto or "").lower())
-    limpio = "".join(c for c in limpio if not unicodedata.combining(c))
-    return " ".join(re.sub(r"[^\w\s]", " ", limpio).split())
+def _normalize(text: str) -> str:
+    clean = unicodedata.normalize("NFKD", (text or "").lower())
+    clean = "".join(c for c in clean if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^\w\s]", " ", clean).split())
 
 
-def _parecido(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, _normalizar(a), _normalizar(b)).ratio()
+def _similarity(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
 
-def variantes_artista(artista) -> list[str]:
-    """Formas alternativas de escribir el nombre del artista.
-
-    Hace falta porque lrclib es literal: '澤野弘之 (Hiroyuki Sawano)' devuelve
-    cero resultados, mientras que 'Hiroyuki Sawano' devuelve la canción. De
-    un nombre así sacamos el nombre sin el 'Ft.', la romanización que está
-    entre paréntesis, y el nombre sin paréntesis."""
-    if not artista:
+def artist_variants(artist) -> list[str]:
+    if not artist:
         return []
 
-    variantes: list[str] = []
+    variants: list[str] = []
 
-    def agregar(valor: str):
-        valor = (valor or "").strip(" -–—·,")
-        if valor and valor not in variantes:
-            variantes.append(valor)
+    def add(value: str):
+        value = (value or "").strip(" -–—·,")
+        if value and value not in variants:
+            variants.append(value)
 
-    base = _FEAT.sub("", artista).strip()
-    agregar(base)
-    for dentro in _PARENTESIS.findall(base):
-        agregar(dentro)
-    agregar(_PARENTESIS.sub("", base))
-    return variantes
+    base = _FEAT.sub("", artist).strip()
+    add(base)
+    for inside in _PARENS.findall(base):
+        add(inside)
+    add(_PARENS.sub("", base))
+    return variants
 
 
-def _aceptable(candidato: dict, artista, duracion) -> bool:
-    """Filtra los resultados que claramente no son la canción.
-
-    Buscar solo por título ('BITE DOWN') trae canciones distintas con el
-    mismo nombre, así que exigimos que coincida la duración o el artista.
-    Sin ninguna de las dos no hay forma de saber si es la correcta, y
-    preferimos decir que no la encontramos antes que mostrar otra letra."""
-    if duracion and candidato.get("duration"):
-        if abs(float(candidato["duration"]) - float(duracion)) <= TOLERANCIA_DURACION:
+def _acceptable(candidate: dict, artist, duration) -> bool:
+    if duration and candidate.get("duration"):
+        if abs(float(candidate["duration"]) - float(duration)) <= DURATION_TOLERANCE:
             return True
 
-    nombre = candidato.get("artistName") or ""
-    return any(_parecido(v, nombre) >= 0.55 for v in variantes_artista(artista))
+    artist_name = candidate.get("artistName") or ""
+    return any(_similarity(v, artist_name) >= 0.55 for v in artist_variants(artist))
 
 
-def _puntaje(candidato: dict, duracion) -> float:
-    """Prefiere las que tienen letra sincronizada y duran lo mismo."""
-    puntos = 0.0
-    if candidato.get("syncedLyrics"):
-        puntos += 10
-    if duracion and candidato.get("duration"):
-        diferencia = abs(float(candidato["duration"]) - float(duracion))
-        if diferencia <= TOLERANCIA_DURACION:
-            puntos += 5 - (diferencia / TOLERANCIA_DURACION)
+def _score(candidate: dict, duration) -> float:
+    points = 0.0
+    if candidate.get("syncedLyrics"):
+        points += 10
+    if duration and candidate.get("duration"):
+        diff = abs(float(candidate["duration"]) - float(duration))
+        if diff <= DURATION_TOLERANCE:
+            points += 5 - (diff / DURATION_TOLERANCE)
         else:
-            puntos -= diferencia / 60          # penaliza según lo lejos que esté
-    if candidato.get("instrumental"):
-        puntos -= 8
-    return puntos
+            points -= diff / 60
+    if candidate.get("instrumental"):
+        points -= 8
+    return points
 
 
-def buscar(titulo: str, artista=None, duracion=None) -> dict | None:
-    """Devuelve {'versos', 'titulo', 'artista', 'duracion'} o None.
+def find(title: str, artist=None, duration=None) -> dict | None:
+    variants = artist_variants(artist)
 
-    'versos' es una lista de (segundo, texto) ordenada por tiempo.
-    """
-    variantes = variantes_artista(artista)
+    queries = []
+    for variant in variants:
+        queries.append({"artist_name": variant, "track_name": title})
+    for variant in variants:
+        queries.append({"q": f"{variant} {title}"})
+    queries.append({"q": title})
 
-    consultas = []
-    for variante in variantes:
-        consultas.append({"artist_name": variante, "track_name": titulo})
-    for variante in variantes:
-        consultas.append({"q": f"{variante} {titulo}"})
-    # Último recurso: solo el título. Trae canciones distintas que se llaman
-    # igual, por eso después filtramos por duración o artista.
-    consultas.append({"q": titulo})
+    seen = []
+    for query in queries:
+        if query not in seen:
+            seen.append(query)
+    queries = seen
 
-    vistas = []
-    for consulta in consultas:
-        if consulta not in vistas:
-            vistas.append(consulta)
-    consultas = vistas
-
-    for parametros in consultas:
+    for query_params in queries:
         try:
-            respuesta = requests.get(API, params=parametros, timeout=10,
-                                     headers={"User-Agent": AGENTE})
-            respuesta.raise_for_status()
-            resultados = respuesta.json()
+            response = requests.get(API, params=query_params, timeout=10,
+                                    headers={"User-Agent": USER_AGENT})
+            response.raise_for_status()
+            results = response.json()
         except Exception:
-            log.exception(f"[karaoke] Falló la búsqueda en lrclib: {parametros}")
+            log.exception(f"[karaoke] Falló la búsqueda en lrclib: {query_params}")
             continue
 
-        conectados = [r for r in resultados
-                      if r.get("syncedLyrics") and _aceptable(r, artista, duracion)]
-        if not conectados:
+        synced = [r for r in results
+                  if r.get("syncedLyrics") and _acceptable(r, artist, duration)]
+        if not synced:
             continue
 
-        mejor = max(conectados, key=lambda r: _puntaje(r, duracion))
-        versos = _parsear_lrc(mejor["syncedLyrics"])
-        if not versos:
+        best = max(synced, key=lambda r: _score(r, duration))
+        verses = _parse_lrc(best["syncedLyrics"])
+        if not verses:
             continue
 
-        log.info(f"[karaoke] {mejor.get('artistName')} - {mejor.get('trackName')} "
-                 f"({len(versos)} versos)")
+        log.info(f"[karaoke] {best.get('artistName')} - {best.get('trackName')} "
+                 f"({len(verses)} versos)")
         return {
-            "versos": versos,
-            "titulo": mejor.get("trackName") or titulo,
-            "artista": mejor.get("artistName") or (artista or ""),
-            "duracion": mejor.get("duration"),
+            "verses": verses,
+            "title": best.get("trackName") or title,
+            "artist": best.get("artistName") or (artist or ""),
+            "duration": best.get("duration"),
         }
 
     return None
 
 
-def indice_actual(versos: list[tuple[float, str]], segundo: float) -> int:
-    """Cuál verso está sonando. -1 si la canción todavía no llegó al primero."""
-    indice = -1
-    for i, (tiempo, _) in enumerate(versos):
-        if tiempo <= segundo:
-            indice = i
+def current_index(verses: list[tuple[float, str]], at_second: float) -> int:
+    index = -1
+    for i, (at, _) in enumerate(verses):
+        if at <= at_second:
+            index = i
         else:
             break
-    return indice
+    return index
 
 
-def ventana(versos: list[tuple[float, str]], actual: int,
-            antes: int = 3, despues: int = 4) -> str:
-    """Arma el bloque de texto: unos versos de contexto y el actual resaltado."""
-    if not versos:
+def window(verses: list[tuple[float, str]], current: int,
+           before: int = 3, after: int = 4) -> str:
+    if not verses:
         return ""
 
-    desde = max(0, actual - antes)
-    hasta = min(len(versos), max(actual, 0) + despues + 1)
+    start = max(0, current - before)
+    end = min(len(verses), max(current, 0) + after + 1)
 
-    lineas = []
-    for i in range(desde, hasta):
-        texto = versos[i][1] or "♪"
-        if i == actual:
-            lineas.append(f"**➤  {texto}**")
+    lines = []
+    for i in range(start, end):
+        text = verses[i][1] or "♪"
+        if i == current:
+            lines.append(f"**➤  {text}**")
         else:
-            lineas.append(f"　{texto}")
-    return "\n".join(lineas)
+            lines.append(f"　{text}")
+    return "\n".join(lines)

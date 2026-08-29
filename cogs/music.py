@@ -67,15 +67,8 @@ MAX_BUFFER_BYTES = int(os.getenv("MAX_BUFFER_BYTES", str(500 * 1024 * 1024)))
 
 AUTO_DISCONNECT_SECONDS = float(os.getenv("AUTO_DISCONNECT_SECONDS", "120"))
 
-# Cada cuánto se redibuja la barra de progreso del mensaje "Reproduciendo
-# ahora". Editar un mensaje es una llamada a la API de Discord, y hacerlo
-# cada 5 segundos alcanzaba para que nos limitaran. Con 15 la barra sigue
-# viéndose viva y gastamos un tercio de las llamadas.
 PROGRESS_UPDATE_SECONDS = float(os.getenv("PROGRESS_UPDATE_SECONDS", "15"))
 
-# Cada cuánto revisa el karaoke si cambió el verso. Solo edita el mensaje
-# cuando cambia de verdad, así que este número es el retraso máximo con el
-# que se ve saltar el resaltado, no la cantidad de llamadas a la API.
 KARAOKE_UPDATE_SECONDS = float(os.getenv("KARAOKE_UPDATE_SECONDS", "2"))
 
 MAX_HISTORY = 100
@@ -86,9 +79,6 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "data", "guild_settings.json")
 _settings_lock = threading.Lock()
 
-# Favoritos persistentes por usuario.
-# Se guarda únicamente una URL por línea en:
-# F:\\Music_Bot\\favorites\\<user_id>.txt
 FAVORITES_DIR = os.path.join(_PROJECT_ROOT, "data", "favorites")
 os.makedirs(FAVORITES_DIR, exist_ok=True)
 _favorites_lock = threading.Lock()
@@ -132,9 +122,9 @@ def get_guild_voteskip(guild_id: int) -> bool:
         return _settings.get(str(guild_id), {}).get("voteskip", True)
 
 
-def set_guild_voteskip(guild_id: int, activo: bool):
+def set_guild_voteskip(guild_id: int, on: bool):
     with _settings_lock:
-        _settings.setdefault(str(guild_id), {})["voteskip"] = activo
+        _settings.setdefault(str(guild_id), {})["voteskip"] = on
         _save_settings(_settings)
 
 
@@ -143,9 +133,9 @@ def get_guild_autoplay(guild_id: int) -> bool:
         return _settings.get(str(guild_id), {}).get("autoplay", False)
 
 
-def set_guild_autoplay(guild_id: int, activo: bool):
+def set_guild_autoplay(guild_id: int, on: bool):
     with _settings_lock:
-        _settings.setdefault(str(guild_id), {})["autoplay"] = activo
+        _settings.setdefault(str(guild_id), {})["autoplay"] = on
         _save_settings(_settings)
 
 
@@ -211,19 +201,7 @@ def _cookie_cli_args() -> list[str]:
 
 
 def spawn_playback_pipeline(webpage_url: str,
-                            inicio: float = 0.0) -> tuple[subprocess.Popen, subprocess.Popen]:
-    """Lanza yt-dlp escribiendo a ffmpeg, que devuelve PCM listo para Discord.
-
-    Con `inicio` mayor que cero arranca desde ese segundo. El -ss va DESPUÉS
-    del -i a propósito: la entrada es una tubería, y una tubería no se puede
-    rebobinar, así que ffmpeg descarta hasta el punto pedido.
-
-    Se probó también resolver la URL directa de googlevideo para que ffmpeg
-    pidiera solo el pedazo necesario, pero YouTube devuelve 403 a menos que
-    se repliquen las cabeceras exactas del cliente que la generó, y no es
-    una pelea que valga la pena: medido, el salto tarda ~10 segundos igual
-    que empezar una canción normal, porque el costo real es que yt-dlp
-    resuelva el video, no descartar audio."""
+                            start_at: float = 0.0) -> tuple[subprocess.Popen, subprocess.Popen]:
     ytdlp_args = [
         sys.executable, "-m", "yt_dlp",
         "-f", "bestaudio/best",
@@ -246,7 +224,7 @@ def spawn_playback_pipeline(webpage_url: str,
     ffmpeg_args = [
         "ffmpeg",
         "-i", "-",
-        *(["-ss", f"{inicio:.2f}"] if inicio > 0 else []),
+        *(["-ss", f"{start_at:.2f}"] if start_at > 0 else []),
         "-f", "s16le",
         "-ar", str(PCM_SAMPLE_RATE),
         "-ac", str(PCM_CHANNELS),
@@ -536,18 +514,12 @@ def fetch_spotify_tracks(kind: str, item_id: str) -> list[dict]:
 
 GENIUS_ACCESS_TOKEN = os.getenv("GENIUS_ACCESS_TOKEN")
 
-# Umbrales de confianza al elegir un resultado de Genius:
-#   score >= LYRICS_AUTO_SCORE     -> lo damos por bueno y mostramos la letra.
-#   entre SUGGEST y AUTO           -> NO adivinamos: le mostramos las opciones
-#                                     al usuario para que elija.
-#   score <  LYRICS_SUGGEST_SCORE  -> lo descartamos, ni lo ofrecemos.
 LYRICS_AUTO_SCORE = 0.70
 LYRICS_SUGGEST_SCORE = 0.30
 LYRICS_MAX_CANDIDATES = 8
 
-# Cachés de sesión (se vacían al reiniciar el bot).
-_lyrics_text_cache: dict[str, str] = {}      # url de Genius -> letra
-_lyrics_choice_cache: dict[str, dict] = {}   # url de YouTube -> candidato elegido a mano
+_lyrics_text_cache: dict[str, str] = {}
+_lyrics_choice_cache: dict[str, dict] = {}
 _LYRICS_CACHE_MAX = 200
 
 
@@ -561,13 +533,6 @@ def _cache_put(cache: dict, key: str, value) -> None:
     cache[key] = value
 
 
-# --------------------------------------------------------------------------
-# Normalización de títulos
-# --------------------------------------------------------------------------
-
-# Palabras que aparecen en los títulos de YouTube pero no son parte del
-# nombre real de la canción. Se usan para dos cosas: limpiar el título antes
-# de buscar, y que no inflen el parecido al comparar candidatos.
 _NOISE_WORDS = {
     "official", "oficial", "officiel", "video", "videoclip", "clip",
     "audio", "lyric", "lyrics", "letra", "letras", "mv", "hd", "hq", "4k",
@@ -578,12 +543,9 @@ _NOISE_WORDS = {
     "topic", "theme", "hi", "res", "new", "with",
 }
 
-# Cuentas de Genius que suben traducciones en vez de la letra original.
 _TRANSLATION_MARKERS = ("traduccion", "traducciones", "translation", "translations", "traducao")
 
 _BRACKET_RE = re.compile(r"[\(\[\{【「（][^\)\]\}】」）]*[\)\]\}】」）]")
-# El "ft. Fulano" se corta hasta el próximo separador, no hasta el final:
-# si no, en "Duki ft. YSY A - Hijo de la Noche" se comería el título entero.
 _FEAT_RE = re.compile(r"\s*(?:feat\.?|ft\.?|featuring)\s+[^\-–—|(\[]+", re.IGNORECASE)
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _UPLOADER_NOISE_RE = re.compile(
@@ -599,7 +561,6 @@ def _strip_accents(text: str) -> str:
 
 
 def _normalize(text: str) -> str:
-    """minúsculas, sin acentos y sin puntuación: 'Amor Mío (Live)' -> 'amor mio live'."""
     text = _strip_accents(text.lower()).replace("&", " and ")
     return " ".join(_PUNCT_RE.sub(" ", text).split())
 
@@ -609,13 +570,6 @@ def _token_set(text: str) -> set[str]:
 
 
 def _similarity(a: str, b: str) -> float:
-    """Parecido entre dos títulos, de 0 a 1.
-
-    Mezcla el parecido carácter a carácter con el parecido por *palabras*.
-    Lo segundo es justamente lo que evita confundir "Amor mío" con "El amor
-    que ya no es mío": comparten un montón de letras (y por eso el método
-    viejo, que solo miraba caracteres, las daba casi por iguales), pero como
-    conjuntos de palabras uno es mucho más grande que el otro."""
     na, nb = _normalize(a), _normalize(b)
     if not na or not nb:
         return 0.0
@@ -623,20 +577,13 @@ def _similarity(a: str, b: str) -> float:
     ta, tb = _token_set(a), _token_set(b)
     if not ta or not tb:
         return seq
-    # Dividir por el conjunto más grande castiga a los candidatos que traen
-    # palabras de más ("el", "que", "ya", "no", "es"...).
     token = len(ta & tb) / max(len(ta), len(tb))
     return 0.6 * token + 0.4 * seq
 
 
 def _drop_noise_brackets(title: str) -> str:
-    """Saca los paréntesis/corchetes que son puro ruido ("(Official Video)",
-    "【MV】", "[Lyrics]") pero deja los que sí cambian de qué canción estamos
-    hablando ("(Remix)", "(Live at Wembley)", "(Acoustic)")."""
-
     def _replace(match: "re.Match") -> str:
         words = set(_normalize(match.group(0)[1:-1]).split())
-        # Los años sueltos también son ruido: "(Remastered 2007)", "(HD 2019)".
         is_noise = bool(words) and all(w in _NOISE_WORDS or w.isdigit() for w in words)
         return " " if is_noise else match.group(0)
 
@@ -644,7 +591,6 @@ def _drop_noise_brackets(title: str) -> str:
 
 
 def _drop_noise_tail(title: str) -> str:
-    """Corta las colas tipo 'Canción | Official Video' o 'Canción • 4K'."""
     parts = re.split(r"\s*[|•·]\s*", title)
     while len(parts) > 1:
         words = set(_normalize(parts[-1]).split())
@@ -663,8 +609,6 @@ def clean_title_for_lyrics_search(title: str) -> str:
 
 
 def split_artist_title(title: str) -> tuple[Optional[str], str]:
-    """'Artista - Canción' -> ('Artista', 'Canción'). Si no hay guion
-    separador devuelve (None, título tal cual)."""
     parts = re.split(r"\s+[-–—]\s+", title, maxsplit=1)
     if len(parts) == 2 and parts[0].strip() and parts[1].strip():
         return parts[0].strip(), parts[1].strip()
@@ -672,9 +616,6 @@ def split_artist_title(title: str) -> tuple[Optional[str], str]:
 
 
 def clean_artist_name(name: Optional[str]) -> Optional[str]:
-    """Limpia el nombre del canal de YouTube: 'Shakira - Topic' -> 'Shakira',
-    'ShakiraVEVO' -> 'Shakira'. Devuelve None si el canal no parece ser el
-    nombre de un artista (ej. 'Rock Nacional Mix 2024 Hits')."""
     if not name:
         return None
     cleaned = name.strip()
@@ -687,17 +628,12 @@ def clean_artist_name(name: Optional[str]) -> Optional[str]:
     cleaned = re.sub(r"vevo$", "", cleaned, flags=re.IGNORECASE).strip()
     if not cleaned:
         return None
-    # Los canales "- Topic" los genera YouTube Music: ahí el nombre del canal
-    # ES el artista, así que le creemos aunque sea largo.
     return cleaned if (is_topic or len(cleaned.split()) <= 4) else None
 
 
 def build_lyrics_queries(
     raw_title: str, artist_hint: Optional[str] = None
 ) -> tuple[str, Optional[str], list[str]]:
-    """Arma varias consultas para Genius, de la más específica a la más
-    genérica. Antes se probaba una sola: si esa fallaba, el bot decía que no
-    encontró la letra aunque la canción estuviera ahí."""
     cleaned = clean_title_for_lyrics_search(raw_title)
     split_artist, split_title = split_artist_title(cleaned)
     channel_artist = clean_artist_name(artist_hint)
@@ -709,7 +645,7 @@ def build_lyrics_queries(
         f"{channel_artist} {split_title}" if channel_artist and channel_artist != artist else None,
         split_title,
         cleaned,
-        " ".join(_BRACKET_RE.sub(" ", split_title).split()),  # sin ningún paréntesis
+        " ".join(_BRACKET_RE.sub(" ", split_title).split()),
     ):
         candidate_query = (candidate_query or "").strip()
         if candidate_query and candidate_query not in queries:
@@ -717,10 +653,6 @@ def build_lyrics_queries(
 
     return split_title, artist, queries
 
-
-# --------------------------------------------------------------------------
-# Búsqueda en Genius
-# --------------------------------------------------------------------------
 
 def _genius_search(query: str, per_page: int = 10) -> list[dict]:
     resp = requests.get(
@@ -740,22 +672,16 @@ def _score_candidate(result: dict, want_title: str, want_artist: Optional[str]) 
 
     score = max(
         _similarity(want_title, cand_title),
-        # El título de YouTube suele venir como "Artista - Canción" y el
-        # full_title de Genius como "Canción by Artista": comparar los
-        # enteros también sirve, pero vale un poco menos que el match limpio.
         0.9 * _similarity(f"{want_artist} {want_title}" if want_artist else want_title, cand_full),
     )
 
     if want_artist:
-        # Mezclamos título y artista en vez de sumar un bonus con tope: así
-        # entre dos canciones que se llaman igual siempre gana la del
-        # artista correcto, en vez de empatar las dos en 1.00.
         score = 0.8 * score + 0.2 * _similarity(want_artist, cand_artist)
 
     if result.get("lyrics_state") != "complete":
         score *= 0.6
     if any(marker in _normalize(cand_artist) for marker in _TRANSLATION_MARKERS):
-        score *= 0.5                            # es una traducción, no la letra original
+        score *= 0.5
     if result.get("instrumental"):
         score *= 0.5
 
@@ -763,8 +689,6 @@ def _score_candidate(result: dict, want_title: str, want_artist: Optional[str]) 
 
 
 def search_genius_candidates(raw_title: str, artist_hint: Optional[str] = None) -> list[dict]:
-    """Devuelve los candidatos de Genius ordenados por confianza (mejor
-    primero), ya filtrados por el umbral mínimo."""
     want_title, want_artist, queries = build_lyrics_queries(raw_title, artist_hint)
     log.info(f"[letras] Buscando {raw_title!r} -> título={want_title!r} artista={want_artist!r}")
 
@@ -792,7 +716,6 @@ def search_genius_candidates(raw_title: str, artist_hint: Optional[str] = None) 
                 "score": _score_candidate(result, want_title, want_artist),
             }
 
-        # Si ya tenemos una coincidencia clara, no gastamos más llamadas.
         if by_id and max(c["score"] for c in by_id.values()) >= LYRICS_AUTO_SCORE:
             break
 
@@ -807,11 +730,6 @@ def search_genius_candidates(raw_title: str, artist_hint: Optional[str] = None) 
 
 
 class _GeniusLyricsParser(html.parser.HTMLParser):
-    """Parser liviano (sin dependencias externas) que junta el texto que
-    está dentro de los <div data-lyrics-container="true"> de una página de
-    Genius. Convierte <br> en saltos de línea y descarta todo lo demás
-    (anotaciones, links a colaboradores, etc.)."""
-
     def __init__(self):
         super().__init__()
         self._depth_stack: list[int] = []
@@ -841,8 +759,6 @@ class _GeniusLyricsParser(html.parser.HTMLParser):
     def get_lyrics(self) -> str:
         text = "".join(self.chunks)
         lines = [line.strip() for line in text.split("\n")]
-        # Colapsa 3+ líneas vacías seguidas en una sola, sin perder los
-        # saltos entre estrofas.
         result_lines: list[str] = []
         blank_streak = 0
         for line in lines:
@@ -854,9 +770,6 @@ class _GeniusLyricsParser(html.parser.HTMLParser):
                 blank_streak = 0
             result_lines.append(line)
 
-        # Genius mete en la misma caja un encabezado que no es la letra:
-        # "25 ContributorsTranslationsEnglish…Título Lyrics…Read More".
-        # Lo cortamos para que el embed arranque directo en la canción.
         if result_lines:
             head = result_lines[0]
             if "Contributor" in head or "Translations" in head:
@@ -896,9 +809,6 @@ def scrape_genius_lyrics(song_url: str) -> Optional[str]:
 
 
 def remember_lyrics_choice(song_key: Optional[str], candidate: dict) -> None:
-    """Si el usuario corrigió a mano qué canción era, nos lo acordamos para
-    esta sesión: la próxima vez que suene ese mismo video no volvemos a
-    adivinar."""
     if song_key:
         _cache_put(_lyrics_choice_cache, song_key, candidate)
 
@@ -906,14 +816,6 @@ def remember_lyrics_choice(song_key: Optional[str], candidate: dict) -> None:
 def resolve_lyrics(
     raw_title: str, artist_hint: Optional[str] = None, song_key: Optional[str] = None
 ) -> dict:
-    """Busca la letra y devuelve un dict con:
-
-      status     -> "ok" (encontrada y confiable) | "ambiguous" (hay
-                    candidatos pero ninguno seguro) | "not_found"
-      lyrics     -> texto de la letra (solo si status == "ok")
-      song       -> candidato elegido (title/artist/url/score)
-      candidates -> lista de candidatos para que elija el usuario
-    """
     if song_key:
         chosen = _lyrics_choice_cache.get(song_key)
         if chosen:
@@ -931,19 +833,14 @@ def resolve_lyrics(
 
     best = candidates[0]
 
-    # Dos canciones distintas que puntúan casi igual (típico: mismo título,
-    # artistas diferentes) es un empate, no una certeza: preguntamos.
     runner_up = candidates[1] if len(candidates) > 1 else None
-    empate = (
+    tie = (
         runner_up is not None
         and best["score"] - runner_up["score"] <= 0.04
         and _normalize(best["artist"]) != _normalize(runner_up["artist"])
     )
 
-    if best["score"] < LYRICS_AUTO_SCORE or empate:
-        # Acá está la diferencia grande con la versión anterior: si no
-        # estamos seguros, NO mandamos la letra de cualquier canción
-        # parecida — devolvemos las opciones para que las vea el usuario.
+    if best["score"] < LYRICS_AUTO_SCORE or tie:
         return {"status": "ambiguous", "lyrics": None, "song": None, "candidates": candidates}
 
     try:
@@ -964,8 +861,6 @@ def resolve_lyrics(
 
 
 def build_lyrics_embeds(song: dict, lyrics: str) -> list[discord.Embed]:
-    """Parte la letra en embeds de 4000 caracteres, cortando en saltos de
-    línea para no partir un verso al medio."""
     display_title = " - ".join(p for p in (song.get("artist"), song.get("title")) if p) or "Letra"
 
     chunks: list[str] = []
@@ -999,8 +894,6 @@ def build_lyrics_embeds(song: dict, lyrics: str) -> list[discord.Embed]:
 
 
 async def _disable_view(view: discord.ui.View) -> None:
-    """Apaga los botones de una vista al vencer el tiempo, para que no queden
-    clickeables dando 'la interacción falló'."""
     for item in view.children:
         item.disabled = True
     message = getattr(view, "message", None)
@@ -1012,9 +905,6 @@ async def _disable_view(view: discord.ui.View) -> None:
 
 
 class LyricsPickerView(discord.ui.View):
-    """Menú para elegir a mano cuál era la canción cuando el bot no está
-    seguro (o cuando eligió mal)."""
-
     def __init__(self, candidates: list[dict], song_key: Optional[str] = None):
         super().__init__(timeout=300)
         self.candidates = candidates[:25]
@@ -1074,9 +964,6 @@ class LyricsPickerView(discord.ui.View):
 
 
 class LyricsCorrectionView(discord.ui.View):
-    """Botón que se cuelga de la letra publicada por si el bot se equivocó
-    de canción: abre el menú con el resto de los candidatos."""
-
     def __init__(self, candidates: list[dict], song_key: Optional[str] = None):
         super().__init__(timeout=600)
         self.candidates = candidates
@@ -1107,12 +994,7 @@ class Song:
     duration: Optional[int]
     requester: str
     thumbnail: Optional[str] = None
-    # Canal de YouTube (o artista, si yt-dlp lo trae). Se usa como pista
-    # para buscar la letra correcta.
     uploader: Optional[str] = None
-    # ID de quien la pidió, para las estadísticas: agrupa aunque la persona
-    # se cambie el apodo. Va en None cuando la puso la radio, y así esas
-    # canciones no ensucian el ranking de personas.
     requester_id: Optional[int] = None
 
 
@@ -1143,14 +1025,13 @@ def format_queue_text(state: "GuildMusicState") -> str:
         lines.append("\n**En cola:**")
         for i, song in enumerate(state.queue, start=1):
             lines.append(f"{i}. {song.title} — pedido por {song.requester}")
-            
-    # NUEVO: Mostrar el progreso de la lista en segundo plano
+
     pl = getattr(state, "active_playlist", None)
     if pl:
         restantes = len(pl["entries"]) - pl["current_index"]
         if restantes > 0:
             lines.append(f"\n🎶 **Playlist en segundo plano:** {pl['title']} ({restantes} canciones restantes)")
-            
+
     if state.loop_mode != "off":
         mode_label = "🔂 canción actual" if state.loop_mode == "song" else "🔁 toda la cola"
         lines.append(f"\nRepetición activa: {mode_label}")
@@ -1212,8 +1093,6 @@ class FavoritesMenuView(discord.ui.View):
             )
             return
 
-        # Resolver los títulos de los favoritos puede tardar más de 3 segundos.
-        # Primero reconocemos la interacción para evitar "Unknown interaction".
         await interaction.response.defer(ephemeral=True)
 
         view = FavoriteSelectView(
@@ -1248,8 +1127,6 @@ class FavoritesMenuView(discord.ui.View):
             )
             return
 
-        # Resolver los títulos de los favoritos puede tardar más de 3 segundos.
-        # Primero reconocemos la interacción para evitar "Unknown interaction".
         await interaction.response.defer(ephemeral=True)
 
         view = FavoriteSelectView(
@@ -1362,7 +1239,6 @@ class FavoriteSelectView(discord.ui.View):
             )
 
     def _rebuild_components(self) -> None:
-        # Conservamos únicamente los botones de paginación.
         for item in list(self.children):
             if isinstance(item, discord.ui.Select):
                 self.remove_item(item)
@@ -1542,8 +1418,6 @@ class FavoriteSelectView(discord.ui.View):
             )
             return
 
-        # La reconstrucción de la página vuelve a consultar metadata con yt-dlp,
-        # así que reconocemos primero la interacción.
         await interaction.response.defer()
 
         removed = remove_favorite(self.user_id, index)
@@ -1555,7 +1429,6 @@ class FavoriteSelectView(discord.ui.View):
             )
             return
 
-        # Recalcular la página por si acabamos de borrar el último elemento.
         if self.page > 0 and self.page >= self.total_pages:
             self.page = self.total_pages - 1
 
@@ -1581,28 +1454,23 @@ class FavoriteSelectView(discord.ui.View):
 
 
 class TopView(discord.ui.View):
-    """Los dos rankings, en un mensaje que solo ve quien apretó el botón.
-
-    Los botones se quedan puestos a propósito: así se puede saltar de un
-    ranking al otro sin volver a pedirlo."""
-
     def __init__(self, cog: "Music", guild_id: int):
         super().__init__(timeout=180)
         self.cog = cog
         self.guild_id = guild_id
 
     @discord.ui.button(label="🎵 Top canciones", style=discord.ButtonStyle.primary)
-    async def top_canciones(self, button: discord.ui.Button,
-                            interaction: discord.Interaction):
+    async def top_songs(self, button: discord.ui.Button,
+                        interaction: discord.Interaction):
         await interaction.response.edit_message(
-            content=None, embed=self.cog.embed_top(self.guild_id, "canciones"),
+            content=None, embed=self.cog.embed_top(self.guild_id, "songs"),
             view=self)
 
     @discord.ui.button(label="👑 Top personas", style=discord.ButtonStyle.secondary)
     async def top_personas(self, button: discord.ui.Button,
                            interaction: discord.Interaction):
         await interaction.response.edit_message(
-            content=None, embed=self.cog.embed_top(self.guild_id, "usuarios"),
+            content=None, embed=self.cog.embed_top(self.guild_id, "users"),
             view=self)
 
     async def on_timeout(self):
@@ -1622,16 +1490,13 @@ class MusicControls(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.guild_id = guild_id
-        # El panel se crea de cero con cada canción, así que los botones que
-        # son interruptores tienen que nacer mostrando el estado real. Si no,
-        # la radio seguía encendida pero el botón decía "Off".
         state = self.cog.get_state(guild_id)
         self.loop_button.label = self.LOOP_LABELS[state.loop_mode]
         self._pintar_radio(state.autoplay)
 
-    def _pintar_radio(self, activo: bool):
-        self.radio_button.label = f"📻 Radio: {'On' if activo else 'Off'}"
-        self.radio_button.style = (discord.ButtonStyle.success if activo
+    def _pintar_radio(self, on: bool):
+        self.radio_button.label = f"📻 Radio: {'On' if on else 'Off'}"
+        self.radio_button.style = (discord.ButtonStyle.success if on
                                    else discord.ButtonStyle.secondary)
 
     @discord.ui.button(label="⏸️ Pausar", style=discord.ButtonStyle.primary, row=0)
@@ -1664,10 +1529,8 @@ class MusicControls(discord.ui.View):
                 "No hay nada sonando ahora mismo.", ephemeral=True)
             return
 
-        mensaje = await self.cog._resolver_skip(state, interaction.user)
-        # El resultado va público a propósito: si es una votación, los demás
-        # tienen que enterarse de que falta su voto.
-        await interaction.response.send_message(mensaje)
+        text_msg = await self.cog._apply_skip(state, interaction.user)
+        await interaction.response.send_message(text_msg)
 
     @discord.ui.button(label="⏹️ Detener", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -1678,7 +1541,7 @@ class MusicControls(discord.ui.View):
         if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
             state.voice_client.stop()
         await interaction.response.send_message("⏹️ Detenido y cola vaciada.", ephemeral=True)
-    
+
     @discord.ui.button(
     label="🗑️ Eliminar playlist",
     style=discord.ButtonStyle.danger,
@@ -1696,13 +1559,12 @@ class MusicControls(discord.ui.View):
 
         playlist_name = state.active_playlist.get("title", "Playlist")
 
-        # Cancelar la playlist en segundo plano
         state.active_playlist = None
 
         await interaction.response.send_message(
             f"🗑️ Playlist **{playlist_name}** eliminada. Las canciones en cola se mantienen.",
             ephemeral=True
-        )    
+        )
 
     @discord.ui.button(label="📜 Lista", style=discord.ButtonStyle.secondary, row=0)
     async def show_queue(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -1790,7 +1652,7 @@ class MusicControls(discord.ui.View):
         if not state.autoplay:
             if state.active_playlist and state.active_playlist.get("es_radio"):
                 state.active_playlist = None
-            state._radio_desde = None
+            state._radio_seed = None
 
         self._pintar_radio(state.autoplay)
         await interaction.response.edit_message(view=self)
@@ -1798,8 +1660,6 @@ class MusicControls(discord.ui.View):
     @discord.ui.button(label="🏆 Top", style=discord.ButtonStyle.secondary, row=2)
     async def top_button(self, button: discord.ui.Button,
                          interaction: discord.Interaction):
-        # Efímero: el ranking lo pidió una persona y no tiene por qué
-        # llenarle el chat a los demás.
         await interaction.response.send_message(
             "¿Qué ranking quieres ver?",
             view=TopView(self.cog, self.guild_id),
@@ -1815,18 +1675,16 @@ class MusicControls(discord.ui.View):
             return
 
         if state.karaoke_task:
-            state.detener_karaoke()
+            state.stop_karaoke()
             await interaction.response.send_message("🎤 Karaoke apagado.", ephemeral=True)
             return
 
         await interaction.response.defer()
 
-        async def enviar(**kwargs):
-            # wait=True para que Discord nos devuelva el Message y podamos
-            # ir editándolo verso a verso.
+        async def send_msg(**kwargs):
             return await interaction.followup.send(wait=True, **kwargs)
 
-        await self.cog.arrancar_karaoke(state, enviar)
+        await self.cog.start_karaoke(state, send_msg)
 
 
 class SearchResultsView(discord.ui.View):
@@ -1974,50 +1832,35 @@ class GuildMusicState:
         self.history: list[Song] = []
         self.active_playlist: Optional[dict] = None
 
-        # Autoplay: cuando la cola se vacía, seguimos con el Mix de YouTube
-        # de la última canción en vez de quedarnos mudos.
         self.autoplay: bool = get_guild_autoplay(guild_id)
-        self._radio_desde: Optional[str] = None
+        self._radio_seed: Optional[str] = None
 
-        # Seek: el segundo desde el que arrancó la reproducción actual, para
-        # que la barra de progreso siga mostrando el minuto real.
         self.pending_seek: Optional[float] = None
         self.seek_offset: float = 0.0
 
         self.karaoke_task: Optional[asyncio.Task] = None
         self.karaoke_msg: Optional[discord.Message] = None
 
-        # Votos para saltar la canción actual. Se vacía en cada canción.
         self.skip_votes: set[int] = set()
 
-    def oyentes(self) -> list:
-        """Quiénes están realmente escuchando en el canal de voz.
-
-        No cuentan los bots ni quien tenga el sonido desactivado: si alguien
-        no puede oír la canción, tampoco debería pesar en el umbral para
-        saltarla."""
+    def listeners(self) -> list:
         if not self.voice_client or not self.voice_client.channel:
             return []
-        gente = []
+        people = []
         for miembro in self.voice_client.channel.members:
             if miembro.bot:
                 continue
             voz = miembro.voice
             if voz and (voz.deaf or voz.self_deaf):
                 continue
-            gente.append(miembro)
-        return gente
+            people.append(miembro)
+        return people
 
-    def votos_necesarios(self) -> int:
-        """La mitad de los que escuchan, redondeando hacia arriba.
-
-        Con 3 o 4 personas dan 2 votos, que es lo habitual en el canal. Con
-        2 alcanza 1, porque exigir unanimidad entre dos es una pelea. El
-        tope de 5 es para que un canal lleno no deje la cola trabada."""
-        cuantos = len(self.oyentes())
-        if cuantos <= 2:
+    def votes_needed(self) -> int:
+        count = len(self.listeners())
+        if count <= 2:
             return 1
-        return min(math.ceil(cuantos / 2), 5)
+        return min(math.ceil(count / 2), 5)
 
     def mark_paused(self):
         if self.pause_started_at is None:
@@ -2034,16 +1877,9 @@ class GuildMusicState:
         now = time.monotonic()
         paused_extra = (now - self.pause_started_at) if self.pause_started_at else 0.0
         transcurrido = now - self.playback_started_at - self.total_paused_seconds - paused_extra
-        # seek_offset es desde dónde arrancó ffmpeg: si saltamos al 1:30, el
-        # primer segundo reproducido es el 90 de la canción, no el 0.
         return max(0.0, self.seek_offset + transcurrido)
 
     async def _update_progress_loop(self):
-        # Guardamos lo último que mandamos para no repetir la misma edición.
-        # Sin esto, con la canción en pausa el reloj queda congelado y el bot
-        # reeditaba el mismo mensaje con el mismo texto cada 5 segundos para
-        # siempre, y Discord terminaba limitándonos ("We are being rate
-        # limited" sobre /channels/.../messages/...).
         ultimo = None
         try:
             while True:
@@ -2068,32 +1904,23 @@ class GuildMusicState:
         except asyncio.CancelledError:
             pass
 
-    # ------------------------------------------------------------- radio
 
-    async def _preparar_radio(self) -> bool:
-        """Arma un Mix de YouTube a partir de lo último que sonó.
-
-        Los Mixes (list=RD<id>) son justamente "radio basada en esta
-        canción", y el bot ya sabe resolverlos para /play, así que
-        reusamos ese camino: dejamos el Mix como active_playlist y el
-        propio ciclo del reproductor lo va consumiendo de a una."""
-        ultima = self.history[-1] if self.history else self.current
-        if not ultima:
+    async def _start_radio(self) -> bool:
+        last_track = self.history[-1] if self.history else self.current
+        if not last_track:
             return False
 
-        # Si ya intentamos armar radio con esta canción, no reintentamos en
-        # bucle: el ciclo pasa por acá cada segundo cuando no hay nada.
-        if self._radio_desde == ultima.webpage_url:
+        if self._radio_seed == last_track.webpage_url:
             return False
-        self._radio_desde = ultima.webpage_url
+        self._radio_seed = last_track.webpage_url
 
-        coincidencia = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
-                                 ultima.webpage_url or "")
-        if not coincidencia:
+        found = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
+                          last_track.webpage_url or "")
+        if not found:
             return False
-        video_id = coincidencia.group(1)
+        video_id = found.group(1)
 
-        log.info(f"[radio] Buscando canciones parecidas a {ultima.title!r}")
+        log.info(f"[radio] Buscando canciones parecidas a {last_track.title!r}")
         try:
             info = await self.cog._extract_playlist(
                 f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}",
@@ -2104,47 +1931,42 @@ class GuildMusicState:
             log.exception("[radio] No pude armar el Mix")
             return False
 
-        ya_sonaron = {s.webpage_url for s in self.history}
-        entradas = []
-        for entrada in (info.get("entries") or []):
-            if not entrada:
+        already_played = {s.webpage_url for s in self.history}
+        elem_list = []
+        for elem in (info.get("entries") or []):
+            if not elem:
                 continue
-            eid = entrada.get("id")
-            url = f"https://www.youtube.com/watch?v={eid}" if eid else entrada.get("url")
-            if url and url not in ya_sonaron:
-                entradas.append(entrada)
+            eid = elem.get("id")
+            url = f"https://www.youtube.com/watch?v={eid}" if eid else elem.get("url")
+            if url and url not in already_played:
+                elem_list.append(elem)
 
-        if not entradas:
+        if not elem_list:
             log.info("[radio] El Mix no trajo nada nuevo")
             return False
 
         self.active_playlist = {
-            "title": f"Radio de {ultima.title}",
-            "entries": entradas,
+            "title": f"Radio de {last_track.title}",
+            "entries": elem_list,
             "current_index": 0,
             "requester": "Autoplay",
             "es_radio": True,
         }
-        log.info(f"[radio] {len(entradas)} canciones en cola")
+        log.info(f"[radio] {len(elem_list)} canciones en cola")
 
         if self.text_channel:
             try:
                 await self.text_channel.send(
                     f"📻 Se acabó la cola, sigo sola con canciones parecidas a "
-                    f"**{ultima.title}**.\n*(Se apaga con `/autoplay`.)*"
+                    f"**{last_track.title}**.\n*(Se apaga con `/autoplay`.)*"
                 )
             except discord.HTTPException:
                 pass
         return True
 
-    # --------------------------------------------------------- presencia
 
-    async def actualizar_presencia(self, cancion: Optional[Song]):
-        """Pone 'Escuchando <canción>' debajo del nombre del bot.
-
-        Es del bot entero, no por servidor: si suena algo en dos servidores
-        a la vez, se ve el último. Es una limitación de Discord."""
-        nuevo = cancion.title[:120] if cancion else None
+    async def update_presence(self, track: Optional[Song]):
+        nuevo = track.title[:120] if track else None
         if getattr(self.bot, "_presencia_actual", "sin definir") == nuevo:
             return
         self.bot._presencia_actual = nuevo
@@ -2155,7 +1977,7 @@ class GuildMusicState:
         except Exception:
             log.exception("No pude actualizar la presencia del bot")
 
-    def detener_karaoke(self):
+    def stop_karaoke(self):
         if self.karaoke_task:
             self.karaoke_task.cancel()
             self.karaoke_task = None
@@ -2166,19 +1988,16 @@ class GuildMusicState:
         while True:
             self.play_next_event.clear()
 
-            # Un /seek no cambia de canción: vuelve a lanzar la misma desde
-            # otro punto. Por eso saltea toda la lógica de cola, repetición
-            # y autoplay, que si no la trataría como "terminó, siguiente".
-            inicio = 0.0
+            start_at = 0.0
             if self.pending_seek is not None and self.current is not None:
-                inicio = max(0.0, self.pending_seek)
+                start_at = max(0.0, self.pending_seek)
                 self.pending_seek = None
                 self.suppress_requeue = False
                 self.skip_song_loop_once = False
                 if self.voice_client is None or not self.voice_client.is_connected():
                     await asyncio.sleep(1)
                     continue
-                await self._reproducir(inicio, es_salto=True)
+                await self._play_current(start_at, is_seek=True)
                 await self.play_next_event.wait()
                 continue
 
@@ -2191,9 +2010,6 @@ class GuildMusicState:
             self.skip_song_loop_once = False
 
             if self.voice_client is None or not self.voice_client.is_connected():
-                # No tocamos la cola ni la playlist activa mientras la voz
-                # esté caída, así no se pierde nada: apenas se reconecte,
-                # seguimos exactamente donde estábamos.
                 await asyncio.sleep(1)
                 continue
 
@@ -2202,19 +2018,14 @@ class GuildMusicState:
                 while pl["current_index"] < len(pl["entries"]):
                     entry = pl["entries"][pl["current_index"]]
                     pl["current_index"] += 1
-                    
+
                     if not entry:
                         continue
-                        
+
                     video_id = entry.get("id")
                     raw_url = entry.get("url")
 
                     if video_id:
-                        # Prioridad al ID: con extracción completa (Mixes),
-                        # entry["url"] puede ser directamente la URL del
-                        # stream de audio (de Google, con vencimiento corto)
-                        # en vez de la página del video — no sirve para
-                        # volver a resolverla más adelante.
                         webpage_url = f"https://www.youtube.com/watch?v={video_id}"
                     elif raw_url and raw_url.startswith("/"):
                         webpage_url = f"https://www.youtube.com{raw_url}"
@@ -2225,18 +2036,16 @@ class GuildMusicState:
 
                     if not webpage_url:
                         continue
-                        
-                    # Como ahora forzamos la extracción pura, yt-dlp sí nos da el título real
+
                     title = entry.get("title") or entry.get("name") or "Sin título"
-                    
-                    # Respaldo súper ligero por si algún video oculto sigue dando problemas
+
                     if title == "Sin título":
                         try:
                             full_info = await self.cog._extract(webpage_url)
                             title = full_info.get("title") or "Sin título"
                         except Exception:
                             pass
-                            
+
                     song = Song(
                         title=title,
                         webpage_url=webpage_url,
@@ -2246,23 +2055,20 @@ class GuildMusicState:
                         uploader=entry.get("uploader") or entry.get("channel"),
                         requester_id=pl.get("requester_id"),
                     )
-                    self.queue.append(song) # Metemos solo la que sigue y rompemos el ciclo
+                    self.queue.append(song)
                     break
-                
-                # Si llegamos al final de la playlist, la borramos
+
                 if pl["current_index"] >= len(pl["entries"]):
                     self.active_playlist = None
 
-            # Cola vacía y sin lista en curso: si el autoplay está activo,
-            # armamos radio con lo último que sonó en vez de callarnos.
             if not self.queue and not self.active_playlist and self.autoplay:
-                await self._preparar_radio()
+                await self._start_radio()
 
             try:
                 self.current = self.queue.popleft()
             except IndexError:
                 self.current = None
-                await self.actualizar_presencia(None)
+                await self.update_presence(None)
                 await asyncio.sleep(1)
                 continue
 
@@ -2270,20 +2076,15 @@ class GuildMusicState:
                 await asyncio.sleep(1)
                 continue
 
-            # Canción nueva: si había radio armada desde otra, ya no aplica.
-            self._radio_desde = None
-            await self._reproducir(0.0, es_salto=False)
+            self._radio_seed = None
+            await self._play_current(0.0, is_seek=False)
             await self.play_next_event.wait()
 
-    async def _reproducir(self, inicio: float, es_salto: bool):
-        """Lanza el audio de self.current, opcionalmente desde un segundo.
-
-        La separamos del ciclo porque /seek necesita hacer exactamente esto
-        mismo sin pasar por la cola ni por la lógica de repetición."""
-        self.detener_karaoke()
+    async def _play_current(self, start_at: float, is_seek: bool):
+        self.stop_karaoke()
 
         preparing_msg = None
-        if self.text_channel and not es_salto:
+        if self.text_channel and not is_seek:
             preparing_msg = await self.text_channel.send(
                 f"🔄 Preparando: **{self.current.title}**..."
             )
@@ -2291,20 +2092,18 @@ class GuildMusicState:
         loop = asyncio.get_event_loop()
         try:
             ytdlp_proc, ffmpeg_proc = await loop.run_in_executor(
-                None, spawn_playback_pipeline, self.current.webpage_url, inicio
+                None, spawn_playback_pipeline, self.current.webpage_url, start_at
             )
         except Exception:
             log.exception("No se pudo lanzar el pipeline de audio")
-            aviso = (f"⚠️ No pude saltar dentro de **{self.current.title}**."
-                     if inicio > 0 else
-                     f"⚠️ No se pudo preparar **{self.current.title}**, la salto.")
+            notice = (f"⚠️ No pude saltar dentro de **{self.current.title}**."
+                      if start_at > 0 else
+                      f"⚠️ No se pudo preparar **{self.current.title}**, la salto.")
             if preparing_msg:
-                await preparing_msg.edit(content=aviso)
+                await preparing_msg.edit(content=notice)
             elif self.text_channel:
-                await self.text_channel.send(aviso)
-            if inicio > 0:
-                # El salto falló pero la canción seguía sonando: la cortamos
-                # nosotros, así que hay que destrabar el ciclo.
+                await self.text_channel.send(notice)
+            if start_at > 0:
                 self.play_next_event.set()
             return
 
@@ -2325,19 +2124,15 @@ class GuildMusicState:
                 self.bot.loop.call_soon_threadsafe(self.progress_task.cancel)
             self.bot.loop.call_soon_threadsafe(self.play_next_event.set)
 
-        # El _after del audio anterior pudo llegar tarde y dejar el evento
-        # marcado. Si no lo limpiamos justo acá, el ciclo despertaría de
-        # inmediato creyendo que esta canción ya terminó y saltaría sola.
         self.play_next_event.clear()
         self.voice_client.play(source, after=_after)
 
         self.playback_started_at = time.monotonic()
         self.pause_started_at = None
         self.total_paused_seconds = 0.0
-        self.seek_offset = inicio
+        self.seek_offset = start_at
 
-        if not es_salto:
-            # Canción nueva, votación desde cero.
+        if not is_seek:
             self.skip_votes.clear()
 
             self.history = [s for s in self.history
@@ -2346,19 +2141,17 @@ class GuildMusicState:
             if len(self.history) > MAX_HISTORY:
                 self.history = self.history[-MAX_HISTORY:]
 
-            stats.registrar(self.guild_id, self.current.title,
-                            self.current.webpage_url, self.current.requester,
-                            self.current.requester_id)
-            await self.actualizar_presencia(self.current)
+            stats.record(self.guild_id, self.current.title,
+                         self.current.webpage_url, self.current.requester,
+                         self.current.requester_id)
+            await self.update_presence(self.current)
 
-        embed = build_now_playing_embed(self.current, inicio, self.loop_mode)
+        embed = build_now_playing_embed(self.current, start_at, self.loop_mode)
         view = MusicControls(self.cog, self.guild_id)
         if preparing_msg:
             await preparing_msg.edit(content=None, embed=embed, view=view)
             self.now_playing_msg = preparing_msg
-        elif es_salto and self.now_playing_msg:
-            # Al saltar reusamos el mensaje que ya estaba, en vez de mandar
-            # uno nuevo por cada /seek.
+        elif is_seek and self.now_playing_msg:
             try:
                 await self.now_playing_msg.edit(embed=embed, view=view)
             except discord.HTTPException:
@@ -2390,10 +2183,6 @@ class Music(commands.Cog):
         return self.states[guild_id]
 
     async def _safe_respond(self, ctx: discord.ApplicationContext, content: str, **kwargs):
-        """Igual que ctx.respond(), pero si el token de la interacción ya
-        expiró (playlists grandes que tardan en extraerse pueden hacer que
-        pase), manda el mensaje directo al canal en vez de tirar un error
-        sin avisarle nada al usuario."""
         try:
             return await ctx.respond(content, **kwargs)
         except (discord.NotFound, discord.HTTPException):
@@ -2423,29 +2212,25 @@ class Music(commands.Cog):
             search_opts = dict(YTDL_OPTS)
             search_opts["extract_flat"] = True
             search_opts["noplaylist"] = False
-            
-            # Eliminamos default_search y source_address para evitar conflictos
+
             search_opts.pop("default_search", None)
             search_opts.pop("source_address", None)
-            
-            # Forzamos a yt-dlp a que use el motor de búsqueda explícitamente
+
             search_query = f"ytsearch{n}:{query}"
-            
+
             with yt_dlp.YoutubeDL(search_opts) as searcher:
                 info = searcher.extract_info(search_query, download=False)
-            
+
             if not info:
                 return []
-                
-            # yt-dlp suele devolver un diccionario con la clave 'entries' en las búsquedas
+
             if "entries" in info:
                 return list(info["entries"])
-            
-            # Como plan B, por si devuelve un único resultado sin meterlo en 'entries'
+
             return [info]
 
         return await loop.run_in_executor(None, _run)
-    
+
     async def _extract_playlist(
         self, url: str, flat: bool = True, playlistend: Optional[int] = None,
         player_client: Optional[list[str]] = None,
@@ -2482,19 +2267,14 @@ class Music(commands.Cog):
         state.text_channel = text_channel
 
         voice_channel = member.voice.channel
-        
-        # --- SOLUCIÓN: Revisar guild.voice_client en lugar de solo state.voice_client ---
+
         if guild.voice_client is None or not guild.voice_client.is_connected():
-            # Si el bot realmente no está en ningún canal, lo conectamos
             state.voice_client = await voice_channel.connect()
             state.history = []
         else:
-            # Si ya está conectado (incluso si se nos reinició el código), recuperamos la sesión
             state.voice_client = guild.voice_client
-            # Y si está en un canal distinto al del usuario, lo movemos
             if state.voice_client.channel.id != voice_channel.id:
                 await state.voice_client.move_to(voice_channel)
-        # --------------------------------------------------------------------------------
 
         song = Song(
             title=title,
@@ -2616,7 +2396,6 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que quieres buscar"),
     ):
-        # 1. Manejo de Spotify
         spotify_match = parse_spotify_url(query) if "open.spotify.com" in query else None
         if spotify_match:
             await self._handle_spotify(ctx, spotify_match)
@@ -2627,7 +2406,6 @@ class Music(commands.Cog):
         if is_url:
             await ctx.defer()
 
-            # 2. NUEVO: Detectar si es un enlace de lista de YouTube (Lazy Loading)
             playlist_ready = False
             playlist_state = None
             if "list=" in query and ("youtube.com" in query or "youtu.be" in query):
@@ -2636,14 +2414,6 @@ class Music(commands.Cog):
                     parsed = urllib.parse.urlparse(query)
                     qs = urllib.parse.parse_qs(parsed.query)
 
-                    # Los Mixes de YouTube (list=RDxxxxx) no tienen una
-                    # página de playlist real en /playlist?list=... — solo
-                    # existen dentro de la URL del video semilla
-                    # (watch?v=...&list=RDxxxx). Si forzamos la URL "limpia"
-                    # de playlist para un Mix, yt-dlp no puede resolverlo y
-                    # termina tratándolo como video suelto. Las playlists
-                    # normales (list=PLxxxx) sí se benefician de la URL
-                    # limpia, así que solo la forzamos en ese caso.
                     list_id = qs.get("list", [None])[0]
                     is_mix = bool(list_id) and list_id.startswith("RD")
 
@@ -2651,21 +2421,13 @@ class Music(commands.Cog):
                     if list_id and not is_mix:
                         clean_url = f"https://www.youtube.com/playlist?list={list_id}"
 
-                    # La extracción completa (no flat) para Mixes era
-                    # demasiado lenta (resuelve cada video entero, JS
-                    # challenge incluido, uno por uno). Volvemos al modo
-                    # rápido, pero forzando el cliente "web" para Mixes: el
-                    # desorden salía porque nuestro forzado normal de
-                    # clientes móviles (android/ios/mweb, usado para evitar
-                    # otro bloqueo al reproducir) arma una secuencia de Mix
-                    # distinta a la que ves en el navegador, que usa "web".
                     info = await self._extract_playlist(
                         clean_url,
                         flat=True,
                         player_client=["web"] if is_mix else None,
                     )
                     entries = info.get("entries")
-                    
+
                     if entries:
                         entries = list(entries)
                         state = self.get_state(ctx.guild.id)
@@ -2686,7 +2448,6 @@ class Music(commands.Cog):
 
                         state.text_channel = ctx.channel
 
-                        # Buscar si el link traía un video específico para empezar desde ahí
                         start_index = 0
                         if "v" in qs:
                             target_v = qs["v"][0]
@@ -2709,11 +2470,6 @@ class Music(commands.Cog):
                     log.exception("Fallo al extraer playlist, procediendo como video único.")
 
             if playlist_ready:
-                # Separado del try/except de arriba a propósito: si esto
-                # falla (ej. la interacción ya expiró por una playlist que
-                # tardó mucho en extraerse), NO queremos que caiga al bloque
-                # de "video único" de abajo, porque la playlist ya quedó
-                # armada y sonando: procesarla de nuevo la duplicaría.
                 await self._safe_respond(
                     ctx,
                     f"🎶 Playlist cargada en segundo plano: **{playlist_state['title']}** "
@@ -2722,7 +2478,6 @@ class Music(commands.Cog):
                 )
                 return
 
-            # 3. Manejo de URL individual (o fallback de playlist fallida)
             try:
                 info = await self._extract(query)
             except Exception as e:
@@ -2743,7 +2498,6 @@ class Music(commands.Cog):
             await self._safe_respond(ctx, msg)
             return
 
-        # 4. Manejo de búsqueda por nombre
         await ctx.defer(ephemeral=True)
         try:
             results = await self._search(query)
@@ -2757,7 +2511,7 @@ class Music(commands.Cog):
             return
 
         view = SearchResultsView(self, ctx.guild, ctx.author, ctx.channel, results)
-        await ctx.respond(f"Resultados para **{query}**, elige uno:", view=view)    
+        await ctx.respond(f"Resultados para **{query}**, elige uno:", view=view)
 
     async def send_lyrics(
         self,
@@ -2766,11 +2520,6 @@ class Music(commands.Cog):
         artist_hint: Optional[str] = None,
         song_key: Optional[str] = None,
     ):
-        """Busca la letra y la manda usando `send` (que puede ser
-        `ctx.followup.send` o `interaction.followup.send`).
-
-        Si no hay una coincidencia confiable NO manda una letra cualquiera:
-        muestra el menú para que el usuario elija la canción correcta."""
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
@@ -2851,49 +2600,46 @@ class Music(commands.Cog):
         await ctx.defer()
         await self.send_lyrics(ctx.followup.send, busqueda)
 
-    # ------------------------------------------------------------- saltar
 
     @staticmethod
-    def _parsear_tiempo(texto: str) -> Optional[float]:
-        """Acepta '90', '1:30' y '1:02:05'. Devuelve segundos o None."""
-        partes = texto.strip().split(":")
-        if not 1 <= len(partes) <= 3:
+    def _parse_time(raw: str) -> Optional[float]:
+        parts = raw.strip().split(":")
+        if not 1 <= len(parts) <= 3:
             return None
         try:
-            numeros = [float(p) for p in partes]
+            units = [float(p) for p in parts]
         except ValueError:
             return None
-        if any(n < 0 for n in numeros):
+        if any(n < 0 for n in units):
             return None
 
         segundos = 0.0
-        for numero in numeros:
-            segundos = segundos * 60 + numero
+        for unit in units:
+            segundos = segundos * 60 + unit
         return segundos
 
-    async def _saltar_a(self, ctx: discord.ApplicationContext, destino: float):
-        """Corta la reproducción actual y la relanza desde `destino`."""
+    async def _seek_to(self, ctx: discord.ApplicationContext, dest: float):
         state = self.get_state(ctx.guild.id)
         if not state.current or not state.voice_client:
             await ctx.respond("No hay nada sonando.", ephemeral=True)
             return
 
-        duracion = state.current.duration
-        if not duracion:
+        secs = state.current.duration
+        if not secs:
             await ctx.respond(
                 "Esta pista es en vivo o no tiene duración conocida, así que no "
                 "puedo saltar dentro de ella.", ephemeral=True)
             return
 
-        destino = max(0.0, min(destino, max(0.0, duracion - 3)))
+        dest = max(0.0, min(dest, max(0.0, secs - 3)))
 
         await ctx.defer()
-        state.pending_seek = destino
+        state.pending_seek = dest
         state.suppress_requeue = True
-        state.voice_client.stop()      # dispara _after y despierta el ciclo
+        state.voice_client.stop()
 
         await ctx.respond(
-            f"⏩ Saltando a **{format_duration(destino)}** de "
+            f"⏩ Saltando a **{format_duration(dest)}** de "
             f"**{state.current.title}**...")
 
     @commands.slash_command(name="seek", description="Salta a un momento de la canción (1:30, 90, 1:02:05)")
@@ -2902,13 +2648,13 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         momento: Option(str, "Minuto al que saltar: 1:30, 90 o 1:02:05"),
     ):
-        segundos = self._parsear_tiempo(momento)
+        segundos = self._parse_time(momento)
         if segundos is None:
             await ctx.respond(
                 f"No entendí **{momento}**. Usa `1:30`, `90` o `1:02:05`.",
                 ephemeral=True)
             return
-        await self._saltar_a(ctx, segundos)
+        await self._seek_to(ctx, segundos)
 
     @commands.slash_command(name="adelantar", description="Adelanta unos segundos la canción")
     async def adelantar(
@@ -2917,7 +2663,7 @@ class Music(commands.Cog):
         segundos: Option(int, "Cuántos segundos adelantar", default=30),
     ):
         state = self.get_state(ctx.guild.id)
-        await self._saltar_a(ctx, state.get_elapsed() + max(1, segundos))
+        await self._seek_to(ctx, state.get_elapsed() + max(1, segundos))
 
     @commands.slash_command(name="atrasar", description="Retrocede unos segundos la canción")
     async def atrasar(
@@ -2926,9 +2672,8 @@ class Music(commands.Cog):
         segundos: Option(int, "Cuántos segundos retroceder", default=30),
     ):
         state = self.get_state(ctx.guild.id)
-        await self._saltar_a(ctx, state.get_elapsed() - max(1, segundos))
+        await self._seek_to(ctx, state.get_elapsed() - max(1, segundos))
 
-    # ------------------------------------------------------------ autoplay
 
     @commands.slash_command(name="autoplay", description="Al vaciarse la cola, sigue sola con canciones parecidas")
     async def autoplay(
@@ -2940,11 +2685,9 @@ class Music(commands.Cog):
         state.autoplay = modo == "on"
         set_guild_autoplay(ctx.guild.id, state.autoplay)
         if not state.autoplay:
-            # Si estaba sonando una radio, la cortamos acá; lo que ya está en
-            # la cola sigue igual.
             if state.active_playlist and state.active_playlist.get("es_radio"):
                 state.active_playlist = None
-            state._radio_desde = None
+            state._radio_seed = None
 
         await ctx.respond(
             "📻 Autoplay **encendido**. Cuando se acabe la cola sigo sola con "
@@ -2952,48 +2695,43 @@ class Music(commands.Cog):
             if state.autoplay else
             "📻 Autoplay **apagado**. Al acabarse la cola me quedo callada.")
 
-    # ----------------------------------------------------------------- top
 
-    def embed_top(self, guild_id: int, que: str) -> discord.Embed:
-        """Arma el ranking. Lo usan el comando /top y los botones del panel,
-        para que muestren exactamente lo mismo."""
-        reproducciones, distintas = stats.totales(guild_id)
+    def embed_top(self, guild_id: int, which: str) -> discord.Embed:
+        plays, unique = stats.totals(guild_id)
         embed = discord.Embed(color=discord.Color.blurple())
-        embed.set_footer(text=f"{reproducciones} reproducciones · "
-                              f"{distintas} canciones distintas")
+        embed.set_footer(text=f"{plays} reproducciones · "
+                         f"{unique} canciones distintas")
 
-        if not reproducciones:
+        if not plays:
             embed.title = "🏆 Todavía nada"
             embed.description = "Pon música y vuelve más tarde ♡"
             return embed
 
-        if que == "usuarios":
+        if which == "users":
             embed.title = "👑 Quién pone más música"
-            lineas = [
-                f"**{i}.** {nombre} — {veces} "
-                f"{'canción' if veces == 1 else 'canciones'}"
-                for i, (nombre, veces) in
-                enumerate(stats.top_usuarios(guild_id), start=1)
+            rows = [
+                f"**{i}.** {name} — {count} "
+                f"{'canción' if count == 1 else 'canciones'}"
+                for i, (name, count) in
+                enumerate(stats.top_users(guild_id), start=1)
             ]
-            embed.description = "\n".join(lineas) or "Nadie todavía."
+            embed.description = "\n".join(rows) or "Nadie todavía."
             return embed
 
         embed.title = "🎵 Lo más escuchado"
-        canciones = stats.top_canciones(guild_id)
-        if not canciones:
-            # Sin esto parecería que el ranking está roto, cuando en realidad
-            # es que ninguna canción se repitió lo suficiente todavía.
+        track_list = stats.top_songs(guild_id)
+        if not track_list:
             embed.description = (
-                f"Ninguna canción llegó todavía a **{stats.MINIMO_REPETICIONES} "
+                f"Ninguna canción llegó todavía a **{stats.MIN_PLAYS} "
                 f"reproducciones**, que es el mínimo para entrar al ranking.\n\n"
-                f"Van {distintas} canciones distintas sonando; en cuanto alguna "
+                f"Van {unique} canciones distintas sonando; en cuanto alguna "
                 f"se repita, aparece acá.")
             return embed
 
         embed.description = "\n".join(
-            f"**{i}.** [{cancion['titulo'][:70]}]({cancion['url']}) — "
-            f"{cancion['veces']} veces"
-            for i, cancion in enumerate(canciones, start=1))
+            f"**{i}.** [{track['title'][:70]}]({track['url']}) — "
+            f"{track['plays']} veces"
+            for i, track in enumerate(track_list, start=1))
         return embed
 
     @commands.slash_command(name="top", description="Lo más escuchado en este servidor")
@@ -3003,9 +2741,9 @@ class Music(commands.Cog):
         que: Option(str, "Qué ranking mostrar", choices=["canciones", "usuarios"],
                     default="canciones"),
     ):
-        await ctx.respond(embed=self.embed_top(ctx.guild.id, que))
+        which = "users" if que == "usuarios" else "songs"
+        await ctx.respond(embed=self.embed_top(ctx.guild.id, which))
 
-    # ----------------------------------------------------------- karaoke
 
     @commands.slash_command(name="karaoke", description="Muestra la letra siguiendo la canción, verso a verso")
     async def karaoke(
@@ -3020,92 +2758,78 @@ class Music(commands.Cog):
             return
 
         if state.karaoke_task and not busqueda:
-            state.detener_karaoke()
+            state.stop_karaoke()
             await ctx.respond("🎤 Karaoke apagado.")
             return
 
-        state.detener_karaoke()
+        state.stop_karaoke()
         await ctx.defer()
 
-        async def enviar(**kwargs):
+        async def send_msg(**kwargs):
             await ctx.respond(**kwargs)
             return await ctx.interaction.original_response()
 
-        await self.arrancar_karaoke(state, enviar, busqueda=busqueda)
+        await self.start_karaoke(state, send_msg, busqueda=busqueda)
 
-    async def arrancar_karaoke(self, state: GuildMusicState, enviar, busqueda=None):
-        """Busca la letra sincronizada y arranca el resaltado.
+    async def start_karaoke(self, state: GuildMusicState, send_msg, busqueda=None):
+        track = state.current
 
-        `enviar` manda el mensaje y devuelve el objeto Message, porque
-        después hay que ir editándolo. Cada sitio que llama acá arma su
-        propio `enviar` (no es lo mismo responder a un comando que a un
-        botón)."""
-        cancion = state.current
-
-        # Si el usuario ya corrigió esta canción en /lyrics, sabemos su
-        # artista y su título de verdad. Sería absurdo volver a adivinarlos
-        # desde el título de YouTube, que es justo lo que había fallado.
-        elegida = None if busqueda else _lyrics_choice_cache.get(cancion.webpage_url)
+        picked = None if busqueda else _lyrics_choice_cache.get(track.webpage_url)
 
         if busqueda:
-            artista, titulo = split_artist_title(busqueda)
-            titulo = titulo or busqueda
-        elif elegida:
-            titulo = elegida.get("title") or cancion.title
-            artista = elegida.get("artist")
-            log.info(f"[karaoke] Uso lo elegido en /lyrics: {artista} - {titulo}")
+            artist_name, song_title = split_artist_title(busqueda)
+            song_title = song_title or busqueda
+        elif picked:
+            song_title = picked.get("title") or track.title
+            artist_name = picked.get("artist")
+            log.info(f"[karaoke] Uso lo elegido en /lyrics: {artist_name} - {song_title}")
         else:
-            artista, titulo = split_artist_title(
-                clean_title_for_lyrics_search(cancion.title))
-            if not artista:
-                artista = clean_artist_name(cancion.uploader)
+            artist_name, song_title = split_artist_title(
+                clean_title_for_lyrics_search(track.title))
+            if not artist_name:
+                artist_name = clean_artist_name(track.uploader)
 
         loop = asyncio.get_event_loop()
-        letra = await loop.run_in_executor(
-            None, lrc.buscar, titulo, artista, cancion.duration)
+        lyrics_data = await loop.run_in_executor(
+            None, lrc.find, song_title, artist_name, track.duration)
 
-        if not letra:
-            aviso = f"No encontré letra sincronizada de **{cancion.title}**.\n"
-            if not elegida:
-                aviso += ("Prueba primero `/lyrics`: si eliges ahí la canción "
-                          "correcta, el karaoke la aprovecha.\n")
-            aviso += ("También puedes decirme el nombre exacto: "
-                      "`/karaoke artista - canción`.")
-            await enviar(content=aviso)
+        if not lyrics_data:
+            notice = f"No encontré letra sincronizada de **{track.title}**.\n"
+            if not picked:
+                notice += ("Prueba primero `/lyrics`: si eliges ahí la canción "
+                           "correcta, el karaoke la aprovecha.\n")
+            notice += ("También puedes decirme el nombre exacto: "
+                       "`/karaoke artista - canción`.")
+            await send_msg(content=notice)
             return
 
-        mensaje = await enviar(embed=discord.Embed(
-            title=f"🎤 {letra['artista']} - {letra['titulo']}"[:256],
+        text_msg = await send_msg(embed=discord.Embed(
+            title=f"🎤 {lyrics_data['artist']} - {lyrics_data['title']}"[:256],
             description="Preparando...", color=discord.Color.blurple()))
 
-        state.karaoke_msg = mensaje
+        state.karaoke_msg = text_msg
         state.karaoke_task = self.bot.loop.create_task(
-            self._bucle_karaoke(state, cancion, letra))
+            self._karaoke_loop(state, track, lyrics_data))
 
-    async def _bucle_karaoke(self, state: GuildMusicState, cancion: "Song", letra: dict):
-        """Va editando el mensaje para resaltar el verso que suena.
-
-        Solo edita cuando el verso cambia de verdad: si editáramos cada
-        pocos segundos pasara lo que pasara, Discord nos limitaría igual que
-        con la barra de progreso."""
-        versos = letra["versos"]
-        ultimo_indice = None
+    async def _karaoke_loop(self, state: GuildMusicState, track: "Song", lyrics_data: dict):
+        verses = lyrics_data["verses"]
+        last_index = None
         try:
             while True:
-                if state.current is not cancion or not state.karaoke_msg:
+                if state.current is not track or not state.karaoke_msg:
                     break
                 if not (state.voice_client and state.voice_client.is_connected()):
                     break
 
-                indice = lrc.indice_actual(versos, state.get_elapsed())
-                if indice != ultimo_indice:
-                    ultimo_indice = indice
+                idx = lrc.current_index(verses, state.get_elapsed())
+                if idx != last_index:
+                    last_index = idx
                     embed = discord.Embed(
-                        title=f"🎤 {letra['artista']} - {letra['titulo']}"[:256],
-                        description=lrc.ventana(versos, indice) or "♪",
+                        title=f"🎤 {lyrics_data['artist']} - {lyrics_data['title']}"[:256],
+                        description=lrc.window(verses, idx) or "♪",
                         color=discord.Color.blurple())
                     embed.set_footer(
-                        text=f"verso {max(indice, 0) + 1}/{len(versos)} · "
+                        text=f"verso {max(idx, 0) + 1}/{len(verses)} · "
                              f"lrclib · /karaoke para apagarlo")
                     try:
                         await state.karaoke_msg.edit(embed=embed)
@@ -3118,7 +2842,6 @@ class Music(commands.Cog):
         finally:
             state.karaoke_task = None
 
-    # --------------------------------------------------------- playlists
 
     playlist = discord.SlashCommandGroup("playlist", "Playlists guardadas del servidor")
 
@@ -3128,8 +2851,8 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         nombre: Option(str, "Nombre de la playlist"),
     ):
-        _, mensaje = pls.crear(ctx.guild.id, nombre, ctx.author.display_name)
-        await ctx.respond(mensaje)
+        _, text_msg = pls.create(ctx.guild.id, nombre, ctx.author.display_name)
+        await ctx.respond(text_msg)
 
     @playlist.command(name="agregar", description="Agrega la canción actual (o un link) a una playlist")
     async def playlist_agregar(
@@ -3147,10 +2870,10 @@ class Music(commands.Cog):
                 log.exception("No pude leer el link para la playlist")
                 await self._safe_respond(ctx, "No pude leer ese link.")
                 return
-            cancion = {
-                "titulo": info.get("title", "Sin título"),
+            track = {
+                "title": info.get("title", "Sin título"),
                 "url": info.get("webpage_url") or info.get("url") or link,
-                "duracion": info.get("duration"),
+                "duration": info.get("duration"),
             }
         else:
             actual = self.get_state(ctx.guild.id).current
@@ -3158,11 +2881,11 @@ class Music(commands.Cog):
                 await self._safe_respond(
                     ctx, "No hay nada sonando. Pásame un link o pon una canción.")
                 return
-            cancion = {"titulo": actual.title, "url": actual.webpage_url,
-                       "duracion": actual.duration}
+            track = {"title": actual.title, "url": actual.webpage_url,
+                     "duration": actual.duration}
 
-        _, mensaje = pls.agregar(ctx.guild.id, nombre, cancion)
-        await self._safe_respond(ctx, mensaje)
+        _, text_msg = pls.add(ctx.guild.id, nombre, track)
+        await self._safe_respond(ctx, text_msg)
 
     @playlist.command(name="tocar", description="Encola todas las canciones de una playlist")
     async def playlist_tocar(
@@ -3170,32 +2893,32 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         nombre: Option(str, "Qué playlist reproducir"),
     ):
-        real, lista = pls.buscar(ctx.guild.id, nombre)
-        if not real:
+        real_name, stored_playlist = pls.find(ctx.guild.id, nombre)
+        if not real_name:
             await ctx.respond(f"No existe ninguna playlist llamada **{nombre}**.",
                               ephemeral=True)
             return
 
-        canciones = lista.get("canciones", [])
-        if not canciones:
-            await ctx.respond(f"**{real}** está vacía.", ephemeral=True)
+        track_list = stored_playlist.get("songs", [])
+        if not track_list:
+            await ctx.respond(f"**{real_name}** está vacía.", ephemeral=True)
             return
 
         await ctx.defer()
-        agregadas = 0
-        for cancion in canciones:
+        queued = 0
+        for track in track_list:
             resultado, _ = await self.handle_play_request(
                 ctx.guild, ctx.author, ctx.channel,
-                cancion.get("titulo", "Sin título"), cancion["url"],
-                cancion.get("duracion"), None,
+                track.get("title", "Sin título"), track["url"],
+                track.get("duration"), None,
             )
-            if resultado is None:      # no está en un canal de voz
+            if resultado is None:
                 await self._safe_respond(ctx, "Tienes que estar en un canal de voz primero.")
                 return
-            agregadas += 1
+            queued += 1
 
         await self._safe_respond(
-            ctx, f"🎶 Encolé **{agregadas}** canciones de **{real}**.")
+            ctx, f"🎶 Encolé **{queued}** canciones de **{real_name}**.")
 
     @playlist.command(name="ver", description="Muestra las playlists, o el contenido de una")
     async def playlist_ver(
@@ -3204,40 +2927,40 @@ class Music(commands.Cog):
         nombre: Option(str, "Cuál ver; vacío = listar todas", required=False) = None,
     ):
         if not nombre:
-            nombres = pls.nombres(ctx.guild.id)
-            if not nombres:
+            names = pls.names(ctx.guild.id)
+            if not names:
                 await ctx.respond(
                     "Este servidor no tiene playlists todavía. Crea una con "
                     "`/playlist crear`.", ephemeral=True)
                 return
-            lineas = []
-            for n in nombres:
-                datos = pls.todas(ctx.guild.id)[n]
-                lineas.append(f"**{n}** — {len(datos.get('canciones', []))} canciones "
-                              f"· de {datos.get('creada_por', '?')}")
+            rows = []
+            for n in names:
+                payload = pls.all_playlists(ctx.guild.id)[n]
+                rows.append(f"**{n}** — {len(payload.get('songs', []))} canciones "
+                            f"· de {payload.get('created_by', '?')}")
             embed = discord.Embed(title="📚 Playlists del servidor",
-                                  description="\n".join(lineas),
+                                  description="\n".join(rows),
                                   color=discord.Color.blurple())
             await ctx.respond(embed=embed)
             return
 
-        real, lista = pls.buscar(ctx.guild.id, nombre)
-        if not real:
+        real_name, stored_playlist = pls.find(ctx.guild.id, nombre)
+        if not real_name:
             await ctx.respond(f"No existe ninguna playlist llamada **{nombre}**.",
                               ephemeral=True)
             return
 
-        canciones = lista.get("canciones", [])
-        lineas = [f"**{i}.** [{c.get('titulo', 'Sin título')[:60]}]({c['url']})"
-                  for i, c in enumerate(canciones[:25], start=1)]
-        if len(canciones) > 25:
-            lineas.append(f"*...y {len(canciones) - 25} más*")
+        track_list = stored_playlist.get("songs", [])
+        rows = [f"**{i}.** [{c.get('title', 'Sin título')[:60]}]({c['url']})"
+                for i, c in enumerate(track_list[:25], start=1)]
+        if len(track_list) > 25:
+            rows.append(f"*...y {len(track_list) - 25} más*")
 
-        embed = discord.Embed(title=f"📚 {real}",
-                              description="\n".join(lineas) or "Está vacía.",
+        embed = discord.Embed(title=f"📚 {real_name}",
+                              description="\n".join(rows) or "Está vacía.",
                               color=discord.Color.blurple())
-        embed.set_footer(text=f"{len(canciones)} canciones · creada por "
-                              f"{lista.get('creada_por', '?')}")
+        embed.set_footer(text=f"{len(track_list)} canciones · creada por "
+                         f"{stored_playlist.get('created_by', '?')}")
         await ctx.respond(embed=embed)
 
     @playlist.command(name="quitar", description="Quita una canción de una playlist por su posición")
@@ -3247,8 +2970,8 @@ class Music(commands.Cog):
         nombre: Option(str, "De qué playlist"),
         posicion: Option(int, "Posición en la lista (mírala con /playlist ver)"),
     ):
-        _, mensaje = pls.quitar(ctx.guild.id, nombre, posicion)
-        await ctx.respond(mensaje)
+        _, text_msg = pls.remove(ctx.guild.id, nombre, posicion)
+        await ctx.respond(text_msg)
 
     @playlist.command(name="borrar", description="Borra una playlist entera")
     async def playlist_borrar(
@@ -3256,60 +2979,54 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         nombre: Option(str, "Cuál borrar"),
     ):
-        _, mensaje = pls.borrar(ctx.guild.id, nombre)
-        await ctx.respond(mensaje)
+        _, text_msg = pls.delete(ctx.guild.id, nombre)
+        await ctx.respond(text_msg)
 
-    def intentar_saltar(self, state: GuildMusicState, usuario) -> tuple[bool, str]:
-        """Decide si la canción se salta ya o si solo queda registrado el voto.
-
-        Devuelve (se_salta, mensaje). Se salta directo si la votación está
-        apagada, si quien pide es quien puso la canción, si está solo en el
-        canal, o si administra el servidor. En cualquier otro caso hace
-        falta que vote la mitad de los que escuchan."""
-        cancion = state.current
-        if not cancion or not state.voice_client:
+    def try_skip(self, state: GuildMusicState, who) -> tuple[bool, str]:
+        track = state.current
+        if not track or not state.voice_client:
             return False, "No hay nada sonando ahora mismo."
 
         if not get_guild_voteskip(state.guild_id):
-            return True, f"⏭️ Salto **{cancion.title}**."
+            return True, f"⏭️ Salto **{track.title}**."
 
-        oyentes = state.oyentes()
-        if len(oyentes) <= 1:
-            return True, f"⏭️ Estás solo en el canal, salto **{cancion.title}**."
+        listeners = state.listeners()
+        if len(listeners) <= 1:
+            return True, f"⏭️ Estás solo en el canal, salto **{track.title}**."
 
-        if cancion.requester == usuario.display_name:
-            return True, (f"⏭️ {usuario.display_name} saltó **{cancion.title}**, "
+        if track.requester == who.display_name:
+            return True, (f"⏭️ {who.display_name} saltó **{track.title}**, "
                           f"que era suya.")
 
-        permisos = getattr(usuario, "guild_permissions", None)
-        if permisos and (permisos.manage_guild or permisos.administrator):
-            return True, f"⏭️ {usuario.display_name} saltó **{cancion.title}**."
+        perms = getattr(who, "guild_permissions", None)
+        if perms and (perms.manage_guild or perms.administrator):
+            return True, f"⏭️ {who.display_name} saltó **{track.title}**."
 
-        necesarios = state.votos_necesarios()
-        if usuario.id in state.skip_votes:
+        needed = state.votes_needed()
+        if who.id in state.skip_votes:
             return False, (f"Ya habías votado. Van **{len(state.skip_votes)}/"
-                           f"{necesarios}** votos para saltar **{cancion.title}**.")
+                           f"{needed}** votos para saltar **{track.title}**.")
 
-        state.skip_votes.add(usuario.id)
-        conseguidos = len(state.skip_votes)
+        state.skip_votes.add(who.id)
+        got = len(state.skip_votes)
 
-        if conseguidos >= necesarios:
-            return True, (f"⏭️ **{conseguidos}/{necesarios}** votos: "
-                          f"salto **{cancion.title}**.")
+        if got >= needed:
+            return True, (f"⏭️ **{got}/{needed}** votos: "
+                          f"salto **{track.title}**.")
 
-        faltan = necesarios - conseguidos
+        missing = needed - got
         return False, (
-            f"🗳️ {usuario.display_name} votó por saltar **{cancion.title}**.\n"
-            f"Van **{conseguidos}/{necesarios}** — "
-            f"{'falta 1 voto' if faltan == 1 else f'faltan {faltan} votos'}.")
+            f"🗳️ {who.display_name} votó por saltar **{track.title}**.\n"
+            f"Van **{got}/{needed}** — "
+            f"{'falta 1 voto' if missing == 1 else f'faltan {missing} votos'}.")
 
-    async def _resolver_skip(self, state: GuildMusicState, usuario) -> str:
-        salta, mensaje = self.intentar_saltar(state, usuario)
-        if salta:
+    async def _apply_skip(self, state: GuildMusicState, who) -> str:
+        skips, text_msg = self.try_skip(state, who)
+        if skips:
             state.skip_votes.clear()
             state.skip_song_loop_once = True
             state.voice_client.stop()
-        return mensaje
+        return text_msg
 
     @commands.slash_command(name="skip", description="Vota para saltar la canción (o la salta, si es tuya)")
     async def skip(self, ctx: discord.ApplicationContext):
@@ -3318,7 +3035,7 @@ class Music(commands.Cog):
                 (state.voice_client.is_playing() or state.voice_client.is_paused())):
             await ctx.respond("No hay nada sonando ahora mismo.")
             return
-        await ctx.respond(await self._resolver_skip(state, ctx.author))
+        await ctx.respond(await self._apply_skip(state, ctx.author))
 
     @commands.slash_command(name="voteskip", description="Activa o desactiva la votación para saltar")
     async def voteskip(
@@ -3326,12 +3043,12 @@ class Music(commands.Cog):
         ctx: discord.ApplicationContext,
         modo: Option(str, "Encender o apagar la votación", choices=["on", "off"]),
     ):
-        activo = modo == "on"
-        set_guild_voteskip(ctx.guild.id, activo)
+        on = modo == "on"
+        set_guild_voteskip(ctx.guild.id, on)
         state = self.get_state(ctx.guild.id)
         state.skip_votes.clear()
 
-        if activo:
+        if on:
             await ctx.respond(
                 "🗳️ Votación para saltar **encendida**.\n"
                 "Hace falta que vote la mitad de los que escuchan (con 3 o 4 en el "

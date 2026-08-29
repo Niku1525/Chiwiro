@@ -1,118 +1,101 @@
-# -*- coding: utf-8 -*-
-"""Playlists con nombre, compartidas por servidor.
-
-Se guardan en playlists/<guild_id>.json:
-
-    {
-      "chill": {
-        "creada_por": "Niku",
-        "canciones": [{"titulo": "...", "url": "...", "duracion": 210}]
-      }
-    }
-
-Son distintas de los favoritos, que son de cada usuario y viven en
-favorites/<user_id>.txt.
-"""
 import os
 import unicodedata
 
 from . import storage
 
-MAX_PLAYLISTS = 25          # el select de Discord no muestra más de 25
-MAX_CANCIONES = 500
+MAX_PLAYLISTS = 25
+MAX_SONGS = 500
 
 
-def _ruta(guild_id: int) -> str:
-    return os.path.join(storage.carpeta("playlists"), f"{guild_id}.json")
+def _path(guild_id: int) -> str:
+    return os.path.join(storage.data_dir("playlists"), f"{guild_id}.json")
 
 
-def _clave(nombre: str) -> str:
-    """Normaliza el nombre para buscar: 'Chill ✿' y 'chill' son la misma."""
-    limpio = unicodedata.normalize("NFKD", nombre.strip().lower())
-    return "".join(c for c in limpio if not unicodedata.combining(c))
+def _key(name: str) -> str:
+    clean = unicodedata.normalize("NFKD", name.strip().lower())
+    return "".join(c for c in clean if not unicodedata.combining(c))
 
 
-def todas(guild_id: int) -> dict:
-    return storage.leer(_ruta(guild_id), {})
+def all_playlists(guild_id: int) -> dict:
+    return storage.read_json(_path(guild_id), {})
 
 
-def _guardar(guild_id: int, datos: dict) -> bool:
-    return storage.guardar(_ruta(guild_id), datos)
+def _write(guild_id: int, data: dict) -> bool:
+    return storage.write_json(_path(guild_id), data)
 
 
-def buscar(guild_id: int, nombre: str):
-    """Devuelve (nombre_real, playlist) o (None, None)."""
-    objetivo = _clave(nombre)
-    for real, datos in todas(guild_id).items():
-        if _clave(real) == objetivo:
-            return real, datos
+def find(guild_id: int, name: str):
+    target = _key(name)
+    for real_name, data in all_playlists(guild_id).items():
+        if _key(real_name) == target:
+            return real_name, data
     return None, None
 
 
-def crear(guild_id: int, nombre: str, autor: str) -> tuple[bool, str]:
-    nombre = nombre.strip()[:60]
-    if not nombre:
+def create(guild_id: int, name: str, author: str) -> tuple[bool, str]:
+    name = name.strip()[:60]
+    if not name:
         return False, "El nombre no puede estar vacío."
 
-    datos = todas(guild_id)
-    if len(datos) >= MAX_PLAYLISTS:
+    data = all_playlists(guild_id)
+    if len(data) >= MAX_PLAYLISTS:
         return False, f"Ya hay {MAX_PLAYLISTS} playlists en este servidor, el máximo."
-    if buscar(guild_id, nombre)[0]:
-        return False, f"Ya existe una playlist llamada **{nombre}**."
+    if find(guild_id, name)[0]:
+        return False, f"Ya existe una playlist llamada **{name}**."
 
-    datos[nombre] = {"creada_por": autor, "canciones": []}
-    if not _guardar(guild_id, datos):
+    data[name] = {"created_by": author, "songs": []}
+    if not _write(guild_id, data):
         return False, "No pude guardar la playlist en el disco."
-    return True, f"Playlist **{nombre}** creada. Agrégale canciones con `/playlist agregar`."
+    return True, f"Playlist **{name}** creada. Agrégale canciones con `/playlist agregar`."
 
 
-def agregar(guild_id: int, nombre: str, cancion: dict) -> tuple[bool, str]:
-    datos = todas(guild_id)
-    real, lista = buscar(guild_id, nombre)
-    if not real:
-        return False, f"No existe ninguna playlist llamada **{nombre}**."
+def add(guild_id: int, name: str, song: dict) -> tuple[bool, str]:
+    data = all_playlists(guild_id)
+    real_name, playlist_data = find(guild_id, name)
+    if not real_name:
+        return False, f"No existe ninguna playlist llamada **{name}**."
 
-    canciones = lista.setdefault("canciones", [])
-    if len(canciones) >= MAX_CANCIONES:
-        return False, f"**{real}** ya tiene {MAX_CANCIONES} canciones, el máximo."
-    if any(c.get("url") == cancion.get("url") for c in canciones):
-        return False, f"**{cancion.get('titulo')}** ya está en **{real}**."
+    songs = playlist_data.setdefault("songs", [])
+    if len(songs) >= MAX_SONGS:
+        return False, f"**{real_name}** ya tiene {MAX_SONGS} canciones, el máximo."
+    if any(c.get("url") == song.get("url") for c in songs):
+        return False, f"**{song.get('title')}** ya está en **{real_name}**."
 
-    canciones.append(cancion)
-    datos[real] = lista
-    if not _guardar(guild_id, datos):
+    songs.append(song)
+    data[real_name] = playlist_data
+    if not _write(guild_id, data):
         return False, "No pude guardar la playlist en el disco."
-    return True, f"Agregada a **{real}**: {cancion.get('titulo')}  ({len(canciones)} en total)"
+    return True, f"Agregada a **{real_name}**: {song.get('title')}  ({len(songs)} en total)"
 
 
-def quitar(guild_id: int, nombre: str, posicion: int) -> tuple[bool, str]:
-    datos = todas(guild_id)
-    real, lista = buscar(guild_id, nombre)
-    if not real:
-        return False, f"No existe ninguna playlist llamada **{nombre}**."
+def remove(guild_id: int, name: str, position: int) -> tuple[bool, str]:
+    data = all_playlists(guild_id)
+    real_name, playlist_data = find(guild_id, name)
+    if not real_name:
+        return False, f"No existe ninguna playlist llamada **{name}**."
 
-    canciones = lista.get("canciones", [])
-    if not 1 <= posicion <= len(canciones):
-        return False, f"**{real}** tiene {len(canciones)} canciones; elige entre 1 y {len(canciones)}."
+    songs = playlist_data.get("songs", [])
+    if not 1 <= position <= len(songs):
+        return False, f"**{real_name}** tiene {len(songs)} canciones; elige entre 1 y {len(songs)}."
 
-    quitada = canciones.pop(posicion - 1)
-    datos[real] = lista
-    if not _guardar(guild_id, datos):
+    removed = songs.pop(position - 1)
+    data[real_name] = playlist_data
+    if not _write(guild_id, data):
         return False, "No pude guardar la playlist en el disco."
-    return True, f"Quitada de **{real}**: {quitada.get('titulo')}"
+    return True, f"Quitada de **{real_name}**: {removed.get('title')}"
 
 
-def borrar(guild_id: int, nombre: str) -> tuple[bool, str]:
-    datos = todas(guild_id)
-    real, _ = buscar(guild_id, nombre)
-    if not real:
-        return False, f"No existe ninguna playlist llamada **{nombre}**."
+def delete(guild_id: int, name: str) -> tuple[bool, str]:
+    data = all_playlists(guild_id)
+    real_name, _ = find(guild_id, name)
+    if not real_name:
+        return False, f"No existe ninguna playlist llamada **{name}**."
 
-    del datos[real]
-    if not _guardar(guild_id, datos):
+    del data[real_name]
+    if not _write(guild_id, data):
         return False, "No pude guardar el cambio en el disco."
-    return True, f"Playlist **{real}** borrada."
+    return True, f"Playlist **{real_name}** borrada."
 
 
-def nombres(guild_id: int) -> list[str]:
-    return sorted(todas(guild_id).keys(), key=_clave)
+def names(guild_id: int) -> list[str]:
+    return sorted(all_playlists(guild_id).keys(), key=_key)

@@ -1,24 +1,3 @@
-# -*- coding: utf-8 -*-
-"""Activa o desactiva que Chiwiro arranque solo al prender la PC.
-
-Usa la carpeta de Inicio de Windows, no el registro. Es a propósito:
-
-- No pide permisos de administrador.
-- Es de tu usuario nada más, no del sistema.
-- Se ve y se apaga desde Configuración → Aplicaciones → Inicio, o en el
-  Administrador de tareas → pestaña Inicio.
-- Para quitarlo alcanza con borrar un archivo (o correr este script con
-  "desactivar"), sin tocar nada delicado.
-
-El acceso directo abre la app con --minimizado: el bot se enciende igual,
-pero la ventana arranca guardada en la barra de tareas en vez de saltar
-sola cada vez que enciendes la computadora.
-
-Uso:
-    venv\\Scripts\\python.exe tools\\windows_startup.py activar
-    venv\\Scripts\\python.exe tools\\windows_startup.py desactivar
-    venv\\Scripts\\python.exe tools\\windows_startup.py estado
-"""
 import os
 import sys
 
@@ -27,85 +6,84 @@ import win32com.client
 from win32com.propsys import propsys, pscon
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PYTHONW = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
-ICONO = os.path.join(BASE, "assets", "chiwiro.ico")
+PYTHONW_PATH = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
+ICON = os.path.join(BASE, "assets", "chiwiro.ico")
 
 APP_ID = "Chiwiro.Music.Bot"
-NOMBRE = "Chiwiro Music.lnk"
+SHORTCUT_NAME = "Chiwiro Music.lnk"
 
-# GETPROPERTYSTOREFLAGS.GPS_READWRITE, que pywin32 no expone como constante.
 GPS_READWRITE = 0x2
 
 
-def carpeta_inicio() -> str:
+def startup_folder() -> str:
     return os.path.join(
         os.environ["APPDATA"],
         "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
     )
 
 
-def ruta_atajo() -> str:
-    return os.path.join(carpeta_inicio(), NOMBRE)
+def shortcut_path() -> str:
+    return os.path.join(startup_folder(), SHORTCUT_NAME)
 
 
-def activar():
-    destino = ruta_atajo()
+def enable():
+    lnk_path = shortcut_path()
 
     shell = win32com.client.Dispatch("WScript.Shell")
-    atajo = shell.CreateShortCut(destino)
-    atajo.TargetPath = PYTHONW
-    atajo.Arguments = r"app\chiwiro_app.py --minimizado"
-    atajo.WorkingDirectory = BASE
-    atajo.IconLocation = f"{ICONO},0"
-    atajo.Description = "Chiwiro Music - arranca con Windows"
-    atajo.WindowStyle = 7          # minimizado (Tk igual necesita el flag)
-    atajo.save()
+    shortcut = shell.CreateShortCut(lnk_path)
+    shortcut.TargetPath = PYTHONW_PATH
+    shortcut.Arguments = r"app\chiwiro_app.py --minimizado"
+    shortcut.WorkingDirectory = BASE
+    shortcut.IconLocation = f"{ICON},0"
+    shortcut.Description = "Chiwiro Music - arranca con Windows"
+    shortcut.WindowStyle = 7
+    shortcut.save()
 
-    almacen = propsys.SHGetPropertyStoreFromParsingName(
-        destino, None, GPS_READWRITE, propsys.IID_IPropertyStore
+    store = propsys.SHGetPropertyStoreFromParsingName(
+        lnk_path, None, GPS_READWRITE, propsys.IID_IPropertyStore
     )
-    almacen.SetValue(pscon.PKEY_AppUserModel_ID,
-                     propsys.PROPVARIANTType(APP_ID, pythoncom.VT_LPWSTR))
-    almacen.Commit()
+    store.SetValue(pscon.PKEY_AppUserModel_ID,
+                   propsys.PROPVARIANTType(APP_ID, pythoncom.VT_LPWSTR))
+    store.Commit()
 
     print("Arranque automático ACTIVADO.")
-    print(f"  {destino}")
+    print(f"  {lnk_path}")
     print("\nLa próxima vez que enciendas la PC, Chiwiro se conecta solo.")
     print("La ventana arranca minimizada en la barra de tareas.")
 
 
-def desactivar():
-    destino = ruta_atajo()
-    if os.path.exists(destino):
-        os.remove(destino)
+def disable():
+    lnk_path = shortcut_path()
+    if os.path.exists(lnk_path):
+        os.remove(lnk_path)
         print("Arranque automático DESACTIVADO.")
-        print(f"  borrado: {destino}")
+        print(f"  borrado: {lnk_path}")
     else:
         print("No estaba activado, no hay nada que borrar.")
 
 
-def estado():
-    destino = ruta_atajo()
-    if os.path.exists(destino):
+def status():
+    lnk_path = shortcut_path()
+    if os.path.exists(lnk_path):
         shell = win32com.client.Dispatch("WScript.Shell")
-        atajo = shell.CreateShortCut(destino)
+        shortcut = shell.CreateShortCut(lnk_path)
         print("Arranque automático: ACTIVADO")
-        print(f"  archivo : {destino}")
-        print(f"  ejecuta : {atajo.TargetPath} {atajo.Arguments}")
+        print(f"  archivo : {lnk_path}")
+        print(f"  ejecuta : {shortcut.TargetPath} {shortcut.Arguments}")
     else:
         print("Arranque automático: desactivado")
 
 
 def main():
-    acciones = {"activar": activar, "desactivar": desactivar, "estado": estado}
-    accion = sys.argv[1].lower() if len(sys.argv) > 1 else "estado"
+    actions = {"activar": enable, "desactivar": disable, "estado": status}
+    action = sys.argv[1].lower() if len(sys.argv) > 1 else "estado"
 
-    if accion not in acciones:
-        print(f"Acción desconocida: {accion!r}")
+    if action not in actions:
+        print(f"Acción desconocida: {action!r}")
         print("Usa una de: activar, desactivar, estado")
         raise SystemExit(1)
 
-    acciones[accion]()
+    actions[action]()
 
 
 if __name__ == "__main__":
