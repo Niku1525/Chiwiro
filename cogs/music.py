@@ -73,6 +73,8 @@ KARAOKE_UPDATE_SECONDS = float(os.getenv("KARAOKE_UPDATE_SECONDS", "2"))
 
 MAX_HISTORY = 100
 
+RADIO_SIZE = int(os.getenv("RADIO_SIZE", "30"))
+
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTS)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1650,7 +1652,7 @@ class MusicControls(discord.ui.View):
         set_guild_autoplay(self.guild_id, state.autoplay)
 
         if not state.autoplay:
-            if state.active_playlist and state.active_playlist.get("es_radio"):
+            if state.active_playlist and state.active_playlist.get("is_radio"):
                 state.active_playlist = None
             state._radio_seed = None
 
@@ -1925,6 +1927,7 @@ class GuildMusicState:
             info = await self.cog._extract_playlist(
                 f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}",
                 flat=True,
+                playlistend=RADIO_SIZE,
                 player_client=["web"],
             )
         except Exception:
@@ -1950,7 +1953,7 @@ class GuildMusicState:
             "entries": elem_list,
             "current_index": 0,
             "requester": "Autoplay",
-            "es_radio": True,
+            "is_radio": True,
         }
         log.info(f"[radio] {len(elem_list)} canciones en cola")
 
@@ -2391,11 +2394,9 @@ class Music(commands.Cog):
         await ctx.channel.send(summary)
 
     @commands.slash_command(name="play", description="Reproduce audio desde un link de YouTube/YT Music/Spotify, o busca por nombre")
-    async def play(
-        self,
-        ctx: discord.ApplicationContext,
-        query: Option(str, "Link de YouTube/YT Music/Spotify, o el nombre de lo que quieres buscar"),
-    ):
+    @discord.option("query", str,
+                    description="Link de YouTube/YT Music/Spotify, o el nombre de lo que quieres buscar")
+    async def play(self, ctx: discord.ApplicationContext, query: str):
         spotify_match = parse_spotify_url(query) if "open.spotify.com" in query else None
         if spotify_match:
             await self._handle_spotify(ctx, spotify_match)
@@ -2563,15 +2564,10 @@ class Music(commands.Cog):
         name="lyrics",
         description="Muestra la letra de lo que está sonando, o de la canción que le pidas",
     )
-    async def lyrics_cmd(
-        self,
-        ctx: discord.ApplicationContext,
-        busqueda: Option(
-            str,
-            "Artista y canción (si lo dejas vacío, usa la que está sonando)",
-            required=False,
-        ) = None,
-    ):
+    @discord.option("busqueda", str,
+                    description="Artista y canción (si lo dejas vacío, usa la que está sonando)",
+                    required=False, default=None)
+    async def lyrics_cmd(self, ctx: discord.ApplicationContext, busqueda: str = None):
         if not genius_configured():
             await ctx.respond(
                 "La búsqueda de letras no está configurada en este bot. "
@@ -2643,11 +2639,8 @@ class Music(commands.Cog):
             f"**{state.current.title}**...")
 
     @commands.slash_command(name="seek", description="Salta a un momento de la canción (1:30, 90, 1:02:05)")
-    async def seek(
-        self,
-        ctx: discord.ApplicationContext,
-        momento: Option(str, "Minuto al que saltar: 1:30, 90 o 1:02:05"),
-    ):
+    @discord.option("momento", str, description="Minuto al que saltar: 1:30, 90 o 1:02:05")
+    async def seek(self, ctx: discord.ApplicationContext, momento: str):
         segundos = self._parse_time(momento)
         if segundos is None:
             await ctx.respond(
@@ -2657,35 +2650,26 @@ class Music(commands.Cog):
         await self._seek_to(ctx, segundos)
 
     @commands.slash_command(name="adelantar", description="Adelanta unos segundos la canción")
-    async def adelantar(
-        self,
-        ctx: discord.ApplicationContext,
-        segundos: Option(int, "Cuántos segundos adelantar", default=30),
-    ):
+    @discord.option("segundos", int, description="Cuántos segundos adelantar", default=30)
+    async def adelantar(self, ctx: discord.ApplicationContext, segundos: int = 30):
         state = self.get_state(ctx.guild.id)
         await self._seek_to(ctx, state.get_elapsed() + max(1, segundos))
 
     @commands.slash_command(name="atrasar", description="Retrocede unos segundos la canción")
-    async def atrasar(
-        self,
-        ctx: discord.ApplicationContext,
-        segundos: Option(int, "Cuántos segundos retroceder", default=30),
-    ):
+    @discord.option("segundos", int, description="Cuántos segundos retroceder", default=30)
+    async def atrasar(self, ctx: discord.ApplicationContext, segundos: int = 30):
         state = self.get_state(ctx.guild.id)
         await self._seek_to(ctx, state.get_elapsed() - max(1, segundos))
 
 
     @commands.slash_command(name="autoplay", description="Al vaciarse la cola, sigue sola con canciones parecidas")
-    async def autoplay(
-        self,
-        ctx: discord.ApplicationContext,
-        modo: Option(str, "Encender o apagar", choices=["on", "off"]),
-    ):
+    @discord.option("modo", str, description="Encender o apagar", choices=["on", "off"])
+    async def autoplay(self, ctx: discord.ApplicationContext, modo: str):
         state = self.get_state(ctx.guild.id)
         state.autoplay = modo == "on"
         set_guild_autoplay(ctx.guild.id, state.autoplay)
         if not state.autoplay:
-            if state.active_playlist and state.active_playlist.get("es_radio"):
+            if state.active_playlist and state.active_playlist.get("is_radio"):
                 state.active_playlist = None
             state._radio_seed = None
 
@@ -2735,23 +2719,17 @@ class Music(commands.Cog):
         return embed
 
     @commands.slash_command(name="top", description="Lo más escuchado en este servidor")
-    async def top(
-        self,
-        ctx: discord.ApplicationContext,
-        que: Option(str, "Qué ranking mostrar", choices=["canciones", "usuarios"],
-                    default="canciones"),
-    ):
+    @discord.option("que", str, description="Qué ranking mostrar",
+                    choices=["canciones", "usuarios"], default="canciones")
+    async def top(self, ctx: discord.ApplicationContext, que: str = "canciones"):
         which = "users" if que == "usuarios" else "songs"
         await ctx.respond(embed=self.embed_top(ctx.guild.id, which))
 
 
     @commands.slash_command(name="karaoke", description="Muestra la letra siguiendo la canción, verso a verso")
-    async def karaoke(
-        self,
-        ctx: discord.ApplicationContext,
-        busqueda: Option(str, "Artista y canción, si no la encuentra sola",
-                         required=False) = None,
-    ):
+    @discord.option("busqueda", str, description="Artista y canción, si no la encuentra sola",
+                    required=False, default=None)
+    async def karaoke(self, ctx: discord.ApplicationContext, busqueda: str = None):
         state = self.get_state(ctx.guild.id)
         if not state.current:
             await ctx.respond("No hay ninguna canción sonando.", ephemeral=True)
@@ -2846,21 +2824,17 @@ class Music(commands.Cog):
     playlist = discord.SlashCommandGroup("playlist", "Playlists guardadas del servidor")
 
     @playlist.command(name="crear", description="Crea una playlist vacía")
-    async def playlist_crear(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "Nombre de la playlist"),
-    ):
+    @discord.option("nombre", str, description="Nombre de la playlist")
+    async def playlist_crear(self, ctx: discord.ApplicationContext, nombre: str):
         _, text_msg = pls.create(ctx.guild.id, nombre, ctx.author.display_name)
         await ctx.respond(text_msg)
 
     @playlist.command(name="agregar", description="Agrega la canción actual (o un link) a una playlist")
-    async def playlist_agregar(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "A qué playlist"),
-        link: Option(str, "Link a agregar; vacío = la que está sonando", required=False) = None,
-    ):
+    @discord.option("nombre", str, description="A qué playlist")
+    @discord.option("link", str, description="Link a agregar; vacío = la que está sonando",
+                    required=False, default=None)
+    async def playlist_agregar(self, ctx: discord.ApplicationContext, nombre: str,
+                               link: str = None):
         await ctx.defer()
 
         if link:
@@ -2888,11 +2862,8 @@ class Music(commands.Cog):
         await self._safe_respond(ctx, text_msg)
 
     @playlist.command(name="tocar", description="Encola todas las canciones de una playlist")
-    async def playlist_tocar(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "Qué playlist reproducir"),
-    ):
+    @discord.option("nombre", str, description="Qué playlist reproducir")
+    async def playlist_tocar(self, ctx: discord.ApplicationContext, nombre: str):
         real_name, stored_playlist = pls.find(ctx.guild.id, nombre)
         if not real_name:
             await ctx.respond(f"No existe ninguna playlist llamada **{nombre}**.",
@@ -2921,11 +2892,9 @@ class Music(commands.Cog):
             ctx, f"🎶 Encolé **{queued}** canciones de **{real_name}**.")
 
     @playlist.command(name="ver", description="Muestra las playlists, o el contenido de una")
-    async def playlist_ver(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "Cuál ver; vacío = listar todas", required=False) = None,
-    ):
+    @discord.option("nombre", str, description="Cuál ver; vacío = listar todas",
+                    required=False, default=None)
+    async def playlist_ver(self, ctx: discord.ApplicationContext, nombre: str = None):
         if not nombre:
             names = pls.names(ctx.guild.id)
             if not names:
@@ -2964,21 +2933,16 @@ class Music(commands.Cog):
         await ctx.respond(embed=embed)
 
     @playlist.command(name="quitar", description="Quita una canción de una playlist por su posición")
-    async def playlist_quitar(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "De qué playlist"),
-        posicion: Option(int, "Posición en la lista (mírala con /playlist ver)"),
-    ):
+    @discord.option("nombre", str, description="De qué playlist")
+    @discord.option("posicion", int, description="Posición en la lista (mírala con /playlist ver)")
+    async def playlist_quitar(self, ctx: discord.ApplicationContext, nombre: str,
+                              posicion: int):
         _, text_msg = pls.remove(ctx.guild.id, nombre, posicion)
         await ctx.respond(text_msg)
 
     @playlist.command(name="borrar", description="Borra una playlist entera")
-    async def playlist_borrar(
-        self,
-        ctx: discord.ApplicationContext,
-        nombre: Option(str, "Cuál borrar"),
-    ):
+    @discord.option("nombre", str, description="Cuál borrar")
+    async def playlist_borrar(self, ctx: discord.ApplicationContext, nombre: str):
         _, text_msg = pls.delete(ctx.guild.id, nombre)
         await ctx.respond(text_msg)
 
@@ -3038,11 +3002,9 @@ class Music(commands.Cog):
         await ctx.respond(await self._apply_skip(state, ctx.author))
 
     @commands.slash_command(name="voteskip", description="Activa o desactiva la votación para saltar")
-    async def voteskip(
-        self,
-        ctx: discord.ApplicationContext,
-        modo: Option(str, "Encender o apagar la votación", choices=["on", "off"]),
-    ):
+    @discord.option("modo", str, description="Encender o apagar la votación",
+                    choices=["on", "off"])
+    async def voteskip(self, ctx: discord.ApplicationContext, modo: str):
         on = modo == "on"
         set_guild_voteskip(ctx.guild.id, on)
         state = self.get_state(ctx.guild.id)
@@ -3105,7 +3067,8 @@ class Music(commands.Cog):
         await ctx.respond(format_queue_text(state))
 
     @commands.slash_command(name="volume", description="Cambia el volumen (0-100)")
-    async def volume(self, ctx: discord.ApplicationContext, nivel: Option(int, "Volumen de 0 a 100")):
+    @discord.option("nivel", int, description="Volumen de 0 a 100")
+    async def volume(self, ctx: discord.ApplicationContext, nivel: int):
         if not 0 <= nivel <= 100:
             await ctx.respond("El nivel tiene que estar entre 0 y 100.")
             return
@@ -3117,11 +3080,9 @@ class Music(commands.Cog):
         await ctx.respond(f"🔊 Volumen ajustado a {nivel}% (se va a recordar para la próxima).")
 
     @commands.slash_command(name="loop", description="Repite la canción actual o toda la cola")
-    async def loop_cmd(
-        self,
-        ctx: discord.ApplicationContext,
-        modo: Option(str, "Modo de repetición", choices=["off", "song", "queue"]),
-    ):
+    @discord.option("modo", str, description="Modo de repetición",
+                    choices=["off", "song", "queue"])
+    async def loop_cmd(self, ctx: discord.ApplicationContext, modo: str):
         state = self.get_state(ctx.guild.id)
         state.loop_mode = modo
         labels = {
@@ -3143,11 +3104,8 @@ class Music(commands.Cog):
         await ctx.respond(f"🔀 Mezclé {len(items)} canciones en la cola.")
 
     @commands.slash_command(name="remove", description="Quita una canción de la cola por posición")
-    async def remove(
-        self,
-        ctx: discord.ApplicationContext,
-        posicion: Option(int, "Posición en la cola (1 = la próxima)"),
-    ):
+    @discord.option("posicion", int, description="Posición en la cola (1 = la próxima)")
+    async def remove(self, ctx: discord.ApplicationContext, posicion: int):
         state = self.get_state(ctx.guild.id)
         if posicion < 1 or posicion > len(state.queue):
             await ctx.respond(f"Posición inválida. La cola tiene {len(state.queue)} canciones.")
