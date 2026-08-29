@@ -127,6 +127,17 @@ def set_guild_volume(guild_id: int, volume: float):
         _save_settings(_settings)
 
 
+def get_guild_voteskip(guild_id: int) -> bool:
+    with _settings_lock:
+        return _settings.get(str(guild_id), {}).get("voteskip", True)
+
+
+def set_guild_voteskip(guild_id: int, activo: bool):
+    with _settings_lock:
+        _settings.setdefault(str(guild_id), {})["voteskip"] = activo
+        _save_settings(_settings)
+
+
 def get_guild_autoplay(guild_id: int) -> bool:
     with _settings_lock:
         return _settings.get(str(guild_id), {}).get("autoplay", False)
@@ -1603,12 +1614,16 @@ class MusicControls(discord.ui.View):
     @discord.ui.button(label="⏭️ Saltar", style=discord.ButtonStyle.primary, row=0)
     async def skip(self, button: discord.ui.Button, interaction: discord.Interaction):
         state = self.cog.get_state(self.guild_id)
-        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
-            state.skip_song_loop_once = True
-            state.voice_client.stop()
-            await interaction.response.send_message("⏭️ Canción saltada.", ephemeral=True)
-        else:
-            await interaction.response.send_message("No hay nada sonando ahora mismo.", ephemeral=True)
+        if not (state.voice_client and
+                (state.voice_client.is_playing() or state.voice_client.is_paused())):
+            await interaction.response.send_message(
+                "No hay nada sonando ahora mismo.", ephemeral=True)
+            return
+
+        mensaje = await self.cog._resolver_skip(state, interaction.user)
+        # El resultado va público a propósito: si es una votación, los demás
+        # tienen que enterarse de que falta su voto.
+        await interaction.response.send_message(mensaje)
 
     @discord.ui.button(label="⏹️ Detener", style=discord.ButtonStyle.danger, row=0)
     async def stop(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -1918,6 +1933,38 @@ class GuildMusicState:
 
         self.karaoke_task: Optional[asyncio.Task] = None
         self.karaoke_msg: Optional[discord.Message] = None
+
+        # Votos para saltar la canción actual. Se vacía en cada canción.
+        self.skip_votes: set[int] = set()
+
+    def oyentes(self) -> list:
+        """Quiénes están realmente escuchando en el canal de voz.
+
+        No cuentan los bots ni quien tenga el sonido desactivado: si alguien
+        no puede oír la canción, tampoco debería pesar en el umbral para
+        saltarla."""
+        if not self.voice_client or not self.voice_client.channel:
+            return []
+        gente = []
+        for miembro in self.voice_client.channel.members:
+            if miembro.bot:
+                continue
+            voz = miembro.voice
+            if voz and (voz.deaf or voz.self_deaf):
+                continue
+            gente.append(miembro)
+        return gente
+
+    def votos_necesarios(self) -> int:
+        """La mitad de los que escuchan, redondeando hacia arriba.
+
+        Con 3 o 4 personas dan 2 votos, que es lo habitual en el canal. Con
+        2 alcanza 1, porque exigir unanimidad entre dos es una pelea. El
+        tope de 5 es para que un canal lleno no deje la cola trabada."""
+        cuantos = len(self.oyentes())
+        if cuantos <= 2:
+            return 1
+        return min(math.ceil(cuantos / 2), 5)
 
     def mark_paused(self):
         if self.pause_started_at is None:
@@ -2236,6 +2283,9 @@ class GuildMusicState:
         self.seek_offset = inicio
 
         if not es_salto:
+            # Canción nueva, votación desde cero.
+            self.skip_votes.clear()
+
             self.history = [s for s in self.history
                             if s.webpage_url != self.current.webpage_url]
             self.history.append(self.current)
@@ -3110,15 +3160,86 @@ class Music(commands.Cog):
         _, mensaje = pls.borrar(ctx.guild.id, nombre)
         await ctx.respond(mensaje)
 
-    @commands.slash_command(name="skip", description="Salta la canción actual")
-    async def skip(self, ctx: discord.ApplicationContext):
-        state = self.get_state(ctx.guild.id)
-        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+    def intentar_saltar(self, state: GuildMusicState, usuario) -> tuple[bool, str]:
+        """Decide si la canción se salta ya o si solo queda registrado el voto.
+
+        Devuelve (se_salta, mensaje). Se salta directo si la votación está
+        apagada, si quien pide es quien puso la canción, si está solo en el
+        canal, o si administra el servidor. En cualquier otro caso hace
+        falta que vote la mitad de los que escuchan."""
+        cancion = state.current
+        if not cancion or not state.voice_client:
+            return False, "No hay nada sonando ahora mismo."
+
+        if not get_guild_voteskip(state.guild_id):
+            return True, f"⏭️ Salto **{cancion.title}**."
+
+        oyentes = state.oyentes()
+        if len(oyentes) <= 1:
+            return True, f"⏭️ Estás solo en el canal, salto **{cancion.title}**."
+
+        if cancion.requester == usuario.display_name:
+            return True, (f"⏭️ {usuario.display_name} saltó **{cancion.title}**, "
+                          f"que era suya.")
+
+        permisos = getattr(usuario, "guild_permissions", None)
+        if permisos and (permisos.manage_guild or permisos.administrator):
+            return True, f"⏭️ {usuario.display_name} saltó **{cancion.title}**."
+
+        necesarios = state.votos_necesarios()
+        if usuario.id in state.skip_votes:
+            return False, (f"Ya habías votado. Van **{len(state.skip_votes)}/"
+                           f"{necesarios}** votos para saltar **{cancion.title}**.")
+
+        state.skip_votes.add(usuario.id)
+        conseguidos = len(state.skip_votes)
+
+        if conseguidos >= necesarios:
+            return True, (f"⏭️ **{conseguidos}/{necesarios}** votos: "
+                          f"salto **{cancion.title}**.")
+
+        faltan = necesarios - conseguidos
+        return False, (
+            f"🗳️ {usuario.display_name} votó por saltar **{cancion.title}**.\n"
+            f"Van **{conseguidos}/{necesarios}** — "
+            f"{'falta 1 voto' if faltan == 1 else f'faltan {faltan} votos'}.")
+
+    async def _resolver_skip(self, state: GuildMusicState, usuario) -> str:
+        salta, mensaje = self.intentar_saltar(state, usuario)
+        if salta:
+            state.skip_votes.clear()
             state.skip_song_loop_once = True
             state.voice_client.stop()
-            await ctx.respond("⏭️ Saltada.")
-        else:
+        return mensaje
+
+    @commands.slash_command(name="skip", description="Vota para saltar la canción (o la salta, si es tuya)")
+    async def skip(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if not (state.voice_client and
+                (state.voice_client.is_playing() or state.voice_client.is_paused())):
             await ctx.respond("No hay nada sonando ahora mismo.")
+            return
+        await ctx.respond(await self._resolver_skip(state, ctx.author))
+
+    @commands.slash_command(name="voteskip", description="Activa o desactiva la votación para saltar")
+    async def voteskip(
+        self,
+        ctx: discord.ApplicationContext,
+        modo: Option(str, "Encender o apagar la votación", choices=["on", "off"]),
+    ):
+        activo = modo == "on"
+        set_guild_voteskip(ctx.guild.id, activo)
+        state = self.get_state(ctx.guild.id)
+        state.skip_votes.clear()
+
+        if activo:
+            await ctx.respond(
+                "🗳️ Votación para saltar **encendida**.\n"
+                "Hace falta que vote la mitad de los que escuchan (con 3 o 4 en el "
+                "canal, 2 votos). Quien puso la canción, quien esté solo y quien "
+                "administre el servidor la saltan directo.")
+        else:
+            await ctx.respond("🗳️ Votación **apagada**: cualquiera puede saltar.")
 
     @commands.slash_command(name="pause", description="Pausa la reproducción")
     async def pause(self, ctx: discord.ApplicationContext):
