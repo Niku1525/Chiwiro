@@ -82,10 +82,20 @@ def registrar(guild_id: int, titulo: str, url: str, pedida_por: str,
         pass
 
 
-def top_canciones(guild_id: int, limite: int = 10) -> list[dict]:
+# Cuántas veces tiene que haber sonado una canción para entrar al ranking.
+# En un servidor donde se pone mucha música, sin este mínimo el top se
+# llena de cosas que sonaron una sola vez y no dice nada de lo que
+# realmente se escucha. El ranking de personas no lo usa: ahí interesa
+# cuántas canciones pidió cada quien, se repitan o no.
+MINIMO_REPETICIONES = 3
+
+
+def top_canciones(guild_id: int, limite: int = 10,
+                  minimo: int = MINIMO_REPETICIONES) -> list[dict]:
     canciones = storage.leer(_ruta(guild_id), {}).get("canciones", {})
     ordenadas = sorted(
-        ({"url": url, **info} for url, info in canciones.items()),
+        ({"url": url, **info} for url, info in canciones.items()
+         if info.get("veces", 0) >= minimo),
         key=lambda c: c.get("veces", 0),
         reverse=True,
     )

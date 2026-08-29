@@ -1580,6 +1580,36 @@ class FavoriteSelectView(discord.ui.View):
             item.disabled = True
 
 
+class TopView(discord.ui.View):
+    """Los dos rankings, en un mensaje que solo ve quien apretó el botón.
+
+    Los botones se quedan puestos a propósito: así se puede saltar de un
+    ranking al otro sin volver a pedirlo."""
+
+    def __init__(self, cog: "Music", guild_id: int):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="🎵 Top canciones", style=discord.ButtonStyle.primary)
+    async def top_canciones(self, button: discord.ui.Button,
+                            interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=None, embed=self.cog.embed_top(self.guild_id, "canciones"),
+            view=self)
+
+    @discord.ui.button(label="👑 Top personas", style=discord.ButtonStyle.secondary)
+    async def top_personas(self, button: discord.ui.Button,
+                           interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            content=None, embed=self.cog.embed_top(self.guild_id, "usuarios"),
+            view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
 class MusicControls(discord.ui.View):
     LOOP_LABELS = {
         "off": "🔁 Repetir: Off",
@@ -1764,6 +1794,17 @@ class MusicControls(discord.ui.View):
 
         self._pintar_radio(state.autoplay)
         await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="🏆 Top", style=discord.ButtonStyle.secondary, row=2)
+    async def top_button(self, button: discord.ui.Button,
+                         interaction: discord.Interaction):
+        # Efímero: el ranking lo pidió una persona y no tiene por qué
+        # llenarle el chat a los demás.
+        await interaction.response.send_message(
+            "¿Qué ranking quieres ver?",
+            view=TopView(self.cog, self.guild_id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="🎤 Karaoke", style=discord.ButtonStyle.secondary, row=2)
     async def karaoke_button(self, button: discord.ui.Button, interaction: discord.Interaction):
@@ -2913,6 +2954,48 @@ class Music(commands.Cog):
 
     # ----------------------------------------------------------------- top
 
+    def embed_top(self, guild_id: int, que: str) -> discord.Embed:
+        """Arma el ranking. Lo usan el comando /top y los botones del panel,
+        para que muestren exactamente lo mismo."""
+        reproducciones, distintas = stats.totales(guild_id)
+        embed = discord.Embed(color=discord.Color.blurple())
+        embed.set_footer(text=f"{reproducciones} reproducciones · "
+                              f"{distintas} canciones distintas")
+
+        if not reproducciones:
+            embed.title = "🏆 Todavía nada"
+            embed.description = "Pon música y vuelve más tarde ♡"
+            return embed
+
+        if que == "usuarios":
+            embed.title = "👑 Quién pone más música"
+            lineas = [
+                f"**{i}.** {nombre} — {veces} "
+                f"{'canción' if veces == 1 else 'canciones'}"
+                for i, (nombre, veces) in
+                enumerate(stats.top_usuarios(guild_id), start=1)
+            ]
+            embed.description = "\n".join(lineas) or "Nadie todavía."
+            return embed
+
+        embed.title = "🎵 Lo más escuchado"
+        canciones = stats.top_canciones(guild_id)
+        if not canciones:
+            # Sin esto parecería que el ranking está roto, cuando en realidad
+            # es que ninguna canción se repitió lo suficiente todavía.
+            embed.description = (
+                f"Ninguna canción llegó todavía a **{stats.MINIMO_REPETICIONES} "
+                f"reproducciones**, que es el mínimo para entrar al ranking.\n\n"
+                f"Van {distintas} canciones distintas sonando; en cuanto alguna "
+                f"se repita, aparece acá.")
+            return embed
+
+        embed.description = "\n".join(
+            f"**{i}.** [{cancion['titulo'][:70]}]({cancion['url']}) — "
+            f"{cancion['veces']} veces"
+            for i, cancion in enumerate(canciones, start=1))
+        return embed
+
     @commands.slash_command(name="top", description="Lo más escuchado en este servidor")
     async def top(
         self,
@@ -2920,32 +3003,7 @@ class Music(commands.Cog):
         que: Option(str, "Qué ranking mostrar", choices=["canciones", "usuarios"],
                     default="canciones"),
     ):
-        reproducciones, distintas = stats.totales(ctx.guild.id)
-        if not reproducciones:
-            await ctx.respond(
-                "Todavía no hay nada que contar. Pon música y vuelve más tarde ♡",
-                ephemeral=True)
-            return
-
-        embed = discord.Embed(color=discord.Color.blurple())
-        embed.set_footer(text=f"{reproducciones} reproducciones · "
-                              f"{distintas} canciones distintas")
-
-        if que == "usuarios":
-            embed.title = "🏆 Quién pone más música"
-            lineas = [f"**{i}.** {nombre} — {veces} canciones"
-                      for i, (nombre, veces) in
-                      enumerate(stats.top_usuarios(ctx.guild.id), start=1)]
-        else:
-            embed.title = "🏆 Lo más escuchado"
-            lineas = []
-            for i, cancion in enumerate(stats.top_canciones(ctx.guild.id), start=1):
-                titulo = cancion["titulo"][:70]
-                lineas.append(f"**{i}.** [{titulo}]({cancion['url']}) — "
-                              f"{cancion['veces']} veces")
-
-        embed.description = "\n".join(lineas) or "Nada todavía."
-        await ctx.respond(embed=embed)
+        await ctx.respond(embed=self.embed_top(ctx.guild.id, que))
 
     # ----------------------------------------------------------- karaoke
 
