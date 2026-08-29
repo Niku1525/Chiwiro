@@ -2934,26 +2934,32 @@ class Music(commands.Cog):
     # ----------------------------------------------------------- karaoke
 
     @commands.slash_command(name="karaoke", description="Muestra la letra siguiendo la canción, verso a verso")
-    async def karaoke(self, ctx: discord.ApplicationContext):
+    async def karaoke(
+        self,
+        ctx: discord.ApplicationContext,
+        busqueda: Option(str, "Artista y canción, si no la encuentra sola",
+                         required=False) = None,
+    ):
         state = self.get_state(ctx.guild.id)
         if not state.current:
             await ctx.respond("No hay ninguna canción sonando.", ephemeral=True)
             return
 
-        if state.karaoke_task:
+        if state.karaoke_task and not busqueda:
             state.detener_karaoke()
             await ctx.respond("🎤 Karaoke apagado.")
             return
 
+        state.detener_karaoke()
         await ctx.defer()
 
         async def enviar(**kwargs):
             await ctx.respond(**kwargs)
             return await ctx.interaction.original_response()
 
-        await self.arrancar_karaoke(state, enviar)
+        await self.arrancar_karaoke(state, enviar, busqueda=busqueda)
 
-    async def arrancar_karaoke(self, state: GuildMusicState, enviar):
+    async def arrancar_karaoke(self, state: GuildMusicState, enviar, busqueda=None):
         """Busca la letra sincronizada y arranca el resaltado.
 
         `enviar` manda el mensaje y devuelve el objeto Message, porque
@@ -2961,18 +2967,37 @@ class Music(commands.Cog):
         propio `enviar` (no es lo mismo responder a un comando que a un
         botón)."""
         cancion = state.current
-        artista, titulo = split_artist_title(clean_title_for_lyrics_search(cancion.title))
-        if not artista:
-            artista = clean_artist_name(cancion.uploader)
+
+        # Si el usuario ya corrigió esta canción en /lyrics, sabemos su
+        # artista y su título de verdad. Sería absurdo volver a adivinarlos
+        # desde el título de YouTube, que es justo lo que había fallado.
+        elegida = None if busqueda else _lyrics_choice_cache.get(cancion.webpage_url)
+
+        if busqueda:
+            artista, titulo = split_artist_title(busqueda)
+            titulo = titulo or busqueda
+        elif elegida:
+            titulo = elegida.get("title") or cancion.title
+            artista = elegida.get("artist")
+            log.info(f"[karaoke] Uso lo elegido en /lyrics: {artista} - {titulo}")
+        else:
+            artista, titulo = split_artist_title(
+                clean_title_for_lyrics_search(cancion.title))
+            if not artista:
+                artista = clean_artist_name(cancion.uploader)
 
         loop = asyncio.get_event_loop()
         letra = await loop.run_in_executor(
             None, lrc.buscar, titulo, artista, cancion.duration)
 
         if not letra:
-            await enviar(content=(
-                f"No encontré letra sincronizada de **{cancion.title}**.\n"
-                f"Prueba con `/lyrics`, que la trae aunque sea sin tiempos."))
+            aviso = f"No encontré letra sincronizada de **{cancion.title}**.\n"
+            if not elegida:
+                aviso += ("Prueba primero `/lyrics`: si eliges ahí la canción "
+                          "correcta, el karaoke la aprovecha.\n")
+            aviso += ("También puedes decirme el nombre exacto: "
+                      "`/karaoke artista - canción`.")
+            await enviar(content=aviso)
             return
 
         mensaje = await enviar(embed=discord.Embed(
