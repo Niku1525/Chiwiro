@@ -15,9 +15,9 @@ pero la ventana arranca guardada en la barra de tareas en vez de saltar
 sola cada vez que enciendes la computadora.
 
 Uso:
-    venv\\Scripts\\python.exe herramientas\\inicio_con_windows.py activar
-    venv\\Scripts\\python.exe herramientas\\inicio_con_windows.py desactivar
-    venv\\Scripts\\python.exe herramientas\\inicio_con_windows.py estado
+    venv\\Scripts\\python.exe tools\\windows_startup.py activar
+    venv\\Scripts\\python.exe tools\\windows_startup.py desactivar
+    venv\\Scripts\\python.exe tools\\windows_startup.py estado
 """
 import os
 import sys

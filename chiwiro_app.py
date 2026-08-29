@@ -24,12 +24,12 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = os.path.join(BASE, "venv", "Scripts", "python.exe")
 BOT = os.path.join(BASE, "bot.py")
 ICONO = os.path.join(BASE, "chiwiro.ico")
-ICONO_GRANDE = os.path.join(BASE, "icons8-rollo-de-canela-100.ico")
+ICONO_GRANDE = os.path.join(BASE, "cinnamoroll-100.ico")
 ENV = os.path.join(BASE, ".env")
 CONFIG = os.path.join(BASE, "app_config.json")
 
 # Tiene que ser idéntico al del acceso directo (ver
-# herramientas/crear_acceso_directo.py) o Windows abre dos botones en la
+# tools/create_shortcut.py) o Windows abre dos botones en la
 # barra de tareas: uno del icono anclado y otro de la ventana.
 APP_ID = "Chiwiro.Music.Bot"
 

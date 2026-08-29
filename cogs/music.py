@@ -23,9 +23,9 @@ from discord import Option
 import requests
 import yt_dlp
 
-from nucleo import estadisticas
-from nucleo import letras_sincronizadas as lrc
-from nucleo import playlists as pls
+from core import stats
+from core import synced_lyrics as lrc
+from core import playlists as pls
 
 log = logging.getLogger("music")
 
@@ -2292,7 +2292,7 @@ class GuildMusicState:
             if len(self.history) > MAX_HISTORY:
                 self.history = self.history[-MAX_HISTORY:]
 
-            estadisticas.registrar(self.guild_id, self.current.title,
+            stats.registrar(self.guild_id, self.current.title,
                                    self.current.webpage_url, self.current.requester)
             await self.actualizar_presencia(self.current)
 
@@ -2904,7 +2904,7 @@ class Music(commands.Cog):
         que: Option(str, "Qué ranking mostrar", choices=["canciones", "usuarios"],
                     default="canciones"),
     ):
-        reproducciones, distintas = estadisticas.totales(ctx.guild.id)
+        reproducciones, distintas = stats.totales(ctx.guild.id)
         if not reproducciones:
             await ctx.respond(
                 "Todavía no hay nada que contar. Pon música y vuelve más tarde ♡",
@@ -2919,11 +2919,11 @@ class Music(commands.Cog):
             embed.title = "🏆 Quién pone más música"
             lineas = [f"**{i}.** {nombre} — {veces} canciones"
                       for i, (nombre, veces) in
-                      enumerate(estadisticas.top_usuarios(ctx.guild.id), start=1)]
+                      enumerate(stats.top_usuarios(ctx.guild.id), start=1)]
         else:
             embed.title = "🏆 Lo más escuchado"
             lineas = []
-            for i, cancion in enumerate(estadisticas.top_canciones(ctx.guild.id), start=1):
+            for i, cancion in enumerate(stats.top_canciones(ctx.guild.id), start=1):
                 titulo = cancion["titulo"][:70]
                 lineas.append(f"**{i}.** [{titulo}]({cancion['url']}) — "
                               f"{cancion['veces']} veces")

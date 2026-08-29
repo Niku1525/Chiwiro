@@ -8,6 +8,6 @@ requests>=2.31.0
 Pillow>=10.0.0
 psutil>=5.9.0
 
-# Solo para las herramientas del acceso directo y el arranque automatico.
-# El bot y la app no lo necesitan para funcionar.
+# Solo para los scripts de tools/ (acceso directo y el arranque automatico.
+# y arranque automatico). El bot y la app no lo necesitan.
 pywin32>=306

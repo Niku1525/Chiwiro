@@ -12,7 +12,7 @@ Dos detalles que importan y por eso no usamos el guardado de ICO de Pillow:
 2. El `append_images` de Pillow no arma multi-tamaño en ICO: guarda uno solo.
    Escribimos el archivo a mano, que el formato es simple.
 
-Uso:  venv\\Scripts\\python.exe herramientas\\generar_icono.py
+Uso:  venv\\Scripts\\python.exe tools\\generate_icon.py
 """
 import os
 import struct
@@ -20,7 +20,7 @@ import struct
 from PIL import Image
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ORIGEN = os.path.join(BASE, "icons8-rollo-de-canela-100.ico")
+ORIGEN = os.path.join(BASE, "cinnamoroll-100.ico")
 SALIDA = os.path.join(BASE, "chiwiro.ico")
 
 TAMANOS = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]

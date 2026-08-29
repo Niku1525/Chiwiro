@@ -16,14 +16,14 @@ favorites/<user_id>.txt.
 import os
 import unicodedata
 
-from . import almacen
+from . import storage
 
 MAX_PLAYLISTS = 25          # el select de Discord no muestra más de 25
 MAX_CANCIONES = 500
 
 
 def _ruta(guild_id: int) -> str:
-    return os.path.join(almacen.carpeta("playlists"), f"{guild_id}.json")
+    return os.path.join(storage.carpeta("playlists"), f"{guild_id}.json")
 
 
 def _clave(nombre: str) -> str:
@@ -33,11 +33,11 @@ def _clave(nombre: str) -> str:
 
 
 def todas(guild_id: int) -> dict:
-    return almacen.leer(_ruta(guild_id), {})
+    return storage.leer(_ruta(guild_id), {})
 
 
 def _guardar(guild_id: int, datos: dict) -> bool:
-    return almacen.guardar(_ruta(guild_id), datos)
+    return storage.guardar(_ruta(guild_id), datos)
 
 
 def buscar(guild_id: int, nombre: str):

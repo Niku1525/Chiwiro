@@ -8,7 +8,7 @@ la app se declara a sí misma (ver chiwiro_app.py), Windows los une en uno.
 
 El .lnk apunta a pythonw.exe (sin consola) del venv.
 
-Uso:  venv\\Scripts\\python.exe herramientas\\crear_acceso_directo.py
+Uso:  venv\\Scripts\\python.exe tools\\create_shortcut.py
 """
 import os
 
