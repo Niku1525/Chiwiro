@@ -19,3 +19,7 @@ venv/
 
 # Preferencias de la app (tema claro/oscuro)
 app_config.json
+
+# Datos que genera el bot en tiempo de ejecucion
+playlists/
+estadisticas/

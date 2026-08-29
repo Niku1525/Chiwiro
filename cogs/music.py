@@ -23,6 +23,10 @@ from discord import Option
 import requests
 import yt_dlp
 
+from nucleo import estadisticas
+from nucleo import letras_sincronizadas as lrc
+from nucleo import playlists as pls
+
 log = logging.getLogger("music")
 
 YTDL_OPTS = {
@@ -68,6 +72,11 @@ AUTO_DISCONNECT_SECONDS = float(os.getenv("AUTO_DISCONNECT_SECONDS", "120"))
 # cada 5 segundos alcanzaba para que nos limitaran. Con 15 la barra sigue
 # viéndose viva y gastamos un tercio de las llamadas.
 PROGRESS_UPDATE_SECONDS = float(os.getenv("PROGRESS_UPDATE_SECONDS", "15"))
+
+# Cada cuánto revisa el karaoke si cambió el verso. Solo edita el mensaje
+# cuando cambia de verdad, así que este número es el retraso máximo con el
+# que se ve saltar el resaltado, no la cantidad de llamadas a la API.
+KARAOKE_UPDATE_SECONDS = float(os.getenv("KARAOKE_UPDATE_SECONDS", "2"))
 
 MAX_HISTORY = 100
 
@@ -115,6 +124,17 @@ def get_guild_volume(guild_id: int) -> float:
 def set_guild_volume(guild_id: int, volume: float):
     with _settings_lock:
         _settings.setdefault(str(guild_id), {})["volume"] = volume
+        _save_settings(_settings)
+
+
+def get_guild_autoplay(guild_id: int) -> bool:
+    with _settings_lock:
+        return _settings.get(str(guild_id), {}).get("autoplay", False)
+
+
+def set_guild_autoplay(guild_id: int, activo: bool):
+    with _settings_lock:
+        _settings.setdefault(str(guild_id), {})["autoplay"] = activo
         _save_settings(_settings)
 
 
@@ -179,7 +199,20 @@ def _cookie_cli_args() -> list[str]:
     return []
 
 
-def spawn_playback_pipeline(webpage_url: str) -> tuple[subprocess.Popen, subprocess.Popen]:
+def spawn_playback_pipeline(webpage_url: str,
+                            inicio: float = 0.0) -> tuple[subprocess.Popen, subprocess.Popen]:
+    """Lanza yt-dlp escribiendo a ffmpeg, que devuelve PCM listo para Discord.
+
+    Con `inicio` mayor que cero arranca desde ese segundo. El -ss va DESPUÉS
+    del -i a propósito: la entrada es una tubería, y una tubería no se puede
+    rebobinar, así que ffmpeg descarta hasta el punto pedido.
+
+    Se probó también resolver la URL directa de googlevideo para que ffmpeg
+    pidiera solo el pedazo necesario, pero YouTube devuelve 403 a menos que
+    se repliquen las cabeceras exactas del cliente que la generó, y no es
+    una pelea que valga la pena: medido, el salto tarda ~10 segundos igual
+    que empezar una canción normal, porque el costo real es que yt-dlp
+    resuelva el video, no descartar audio."""
     ytdlp_args = [
         sys.executable, "-m", "yt_dlp",
         "-f", "bestaudio/best",
@@ -202,6 +235,7 @@ def spawn_playback_pipeline(webpage_url: str) -> tuple[subprocess.Popen, subproc
     ffmpeg_args = [
         "ffmpeg",
         "-i", "-",
+        *(["-ss", f"{inicio:.2f}"] if inicio > 0 else []),
         "-f", "s16le",
         "-ar", str(PCM_SAMPLE_RATE),
         "-ac", str(PCM_CHANNELS),
@@ -1688,6 +1722,44 @@ class MusicControls(discord.ui.View):
             song_key=state.current.webpage_url,
         )
 
+    @discord.ui.button(label="📻 Radio: Off", style=discord.ButtonStyle.secondary, row=2)
+    async def radio_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        state.autoplay = not state.autoplay
+        set_guild_autoplay(self.guild_id, state.autoplay)
+
+        if not state.autoplay:
+            if state.active_playlist and state.active_playlist.get("es_radio"):
+                state.active_playlist = None
+            state._radio_desde = None
+
+        button.label = f"📻 Radio: {'On' if state.autoplay else 'Off'}"
+        button.style = (discord.ButtonStyle.success if state.autoplay
+                        else discord.ButtonStyle.secondary)
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="🎤 Karaoke", style=discord.ButtonStyle.secondary, row=2)
+    async def karaoke_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        state = self.cog.get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message(
+                "No hay ninguna canción sonando ahora mismo.", ephemeral=True)
+            return
+
+        if state.karaoke_task:
+            state.detener_karaoke()
+            await interaction.response.send_message("🎤 Karaoke apagado.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        async def enviar(**kwargs):
+            # wait=True para que Discord nos devuelva el Message y podamos
+            # ir editándolo verso a verso.
+            return await interaction.followup.send(wait=True, **kwargs)
+
+        await self.cog.arrancar_karaoke(state, enviar)
+
 
 class SearchResultsView(discord.ui.View):
     def __init__(self, cog: "Music", guild: discord.Guild, author: discord.Member,
@@ -1834,6 +1906,19 @@ class GuildMusicState:
         self.history: list[Song] = []
         self.active_playlist: Optional[dict] = None
 
+        # Autoplay: cuando la cola se vacía, seguimos con el Mix de YouTube
+        # de la última canción en vez de quedarnos mudos.
+        self.autoplay: bool = get_guild_autoplay(guild_id)
+        self._radio_desde: Optional[str] = None
+
+        # Seek: el segundo desde el que arrancó la reproducción actual, para
+        # que la barra de progreso siga mostrando el minuto real.
+        self.pending_seek: Optional[float] = None
+        self.seek_offset: float = 0.0
+
+        self.karaoke_task: Optional[asyncio.Task] = None
+        self.karaoke_msg: Optional[discord.Message] = None
+
     def mark_paused(self):
         if self.pause_started_at is None:
             self.pause_started_at = time.monotonic()
@@ -1848,7 +1933,10 @@ class GuildMusicState:
             return 0.0
         now = time.monotonic()
         paused_extra = (now - self.pause_started_at) if self.pause_started_at else 0.0
-        return max(0.0, now - self.playback_started_at - self.total_paused_seconds - paused_extra)
+        transcurrido = now - self.playback_started_at - self.total_paused_seconds - paused_extra
+        # seek_offset es desde dónde arrancó ffmpeg: si saltamos al 1:30, el
+        # primer segundo reproducido es el 90 de la canción, no el 0.
+        return max(0.0, self.seek_offset + transcurrido)
 
     async def _update_progress_loop(self):
         # Guardamos lo último que mandamos para no repetir la misma edición.
@@ -1880,10 +1968,119 @@ class GuildMusicState:
         except asyncio.CancelledError:
             pass
 
+    # ------------------------------------------------------------- radio
+
+    async def _preparar_radio(self) -> bool:
+        """Arma un Mix de YouTube a partir de lo último que sonó.
+
+        Los Mixes (list=RD<id>) son justamente "radio basada en esta
+        canción", y el bot ya sabe resolverlos para /play, así que
+        reusamos ese camino: dejamos el Mix como active_playlist y el
+        propio ciclo del reproductor lo va consumiendo de a una."""
+        ultima = self.history[-1] if self.history else self.current
+        if not ultima:
+            return False
+
+        # Si ya intentamos armar radio con esta canción, no reintentamos en
+        # bucle: el ciclo pasa por acá cada segundo cuando no hay nada.
+        if self._radio_desde == ultima.webpage_url:
+            return False
+        self._radio_desde = ultima.webpage_url
+
+        coincidencia = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})",
+                                 ultima.webpage_url or "")
+        if not coincidencia:
+            return False
+        video_id = coincidencia.group(1)
+
+        log.info(f"[radio] Buscando canciones parecidas a {ultima.title!r}")
+        try:
+            info = await self.cog._extract_playlist(
+                f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}",
+                flat=True,
+                player_client=["web"],
+            )
+        except Exception:
+            log.exception("[radio] No pude armar el Mix")
+            return False
+
+        ya_sonaron = {s.webpage_url for s in self.history}
+        entradas = []
+        for entrada in (info.get("entries") or []):
+            if not entrada:
+                continue
+            eid = entrada.get("id")
+            url = f"https://www.youtube.com/watch?v={eid}" if eid else entrada.get("url")
+            if url and url not in ya_sonaron:
+                entradas.append(entrada)
+
+        if not entradas:
+            log.info("[radio] El Mix no trajo nada nuevo")
+            return False
+
+        self.active_playlist = {
+            "title": f"Radio de {ultima.title}",
+            "entries": entradas,
+            "current_index": 0,
+            "requester": "Autoplay",
+            "es_radio": True,
+        }
+        log.info(f"[radio] {len(entradas)} canciones en cola")
+
+        if self.text_channel:
+            try:
+                await self.text_channel.send(
+                    f"📻 Se acabó la cola, sigo sola con canciones parecidas a "
+                    f"**{ultima.title}**.\n*(Se apaga con `/autoplay`.)*"
+                )
+            except discord.HTTPException:
+                pass
+        return True
+
+    # --------------------------------------------------------- presencia
+
+    async def actualizar_presencia(self, cancion: Optional[Song]):
+        """Pone 'Escuchando <canción>' debajo del nombre del bot.
+
+        Es del bot entero, no por servidor: si suena algo en dos servidores
+        a la vez, se ve el último. Es una limitación de Discord."""
+        nuevo = cancion.title[:120] if cancion else None
+        if getattr(self.bot, "_presencia_actual", "sin definir") == nuevo:
+            return
+        self.bot._presencia_actual = nuevo
+        try:
+            actividad = (discord.Activity(type=discord.ActivityType.listening, name=nuevo)
+                         if nuevo else None)
+            await self.bot.change_presence(activity=actividad)
+        except Exception:
+            log.exception("No pude actualizar la presencia del bot")
+
+    def detener_karaoke(self):
+        if self.karaoke_task:
+            self.karaoke_task.cancel()
+            self.karaoke_task = None
+        self.karaoke_msg = None
+
     async def _player_loop(self):
         await self.bot.wait_until_ready()
         while True:
             self.play_next_event.clear()
+
+            # Un /seek no cambia de canción: vuelve a lanzar la misma desde
+            # otro punto. Por eso saltea toda la lógica de cola, repetición
+            # y autoplay, que si no la trataría como "terminó, siguiente".
+            inicio = 0.0
+            if self.pending_seek is not None and self.current is not None:
+                inicio = max(0.0, self.pending_seek)
+                self.pending_seek = None
+                self.suppress_requeue = False
+                self.skip_song_loop_once = False
+                if self.voice_client is None or not self.voice_client.is_connected():
+                    await asyncio.sleep(1)
+                    continue
+                await self._reproducir(inicio, es_salto=True)
+                await self.play_next_event.wait()
+                continue
 
             if self.current is not None and not self.suppress_requeue:
                 if self.loop_mode == "queue":
@@ -1955,11 +2152,16 @@ class GuildMusicState:
                 if pl["current_index"] >= len(pl["entries"]):
                     self.active_playlist = None
 
-            # CÓDIGO EXISTENTE:
+            # Cola vacía y sin lista en curso: si el autoplay está activo,
+            # armamos radio con lo último que sonó en vez de callarnos.
+            if not self.queue and not self.active_playlist and self.autoplay:
+                await self._preparar_radio()
+
             try:
                 self.current = self.queue.popleft()
             except IndexError:
                 self.current = None
+                await self.actualizar_presencia(None)
                 await asyncio.sleep(1)
                 continue
 
@@ -1967,66 +2169,101 @@ class GuildMusicState:
                 await asyncio.sleep(1)
                 continue
 
-            preparing_msg = None
-            if self.text_channel:
-                preparing_msg = await self.text_channel.send(
-                    f"🔄 Preparando: **{self.current.title}**..."
-                )
+            # Canción nueva: si había radio armada desde otra, ya no aplica.
+            self._radio_desde = None
+            await self._reproducir(0.0, es_salto=False)
+            await self.play_next_event.wait()
 
-            loop = asyncio.get_event_loop()
-            try:
-                ytdlp_proc, ffmpeg_proc = await loop.run_in_executor(
-                    None, spawn_playback_pipeline, self.current.webpage_url
-                )
-            except Exception:
-                log.exception("No se pudo lanzar el pipeline de audio")
-                if preparing_msg:
-                    await preparing_msg.edit(
-                        content=f"⚠️ No se pudo preparar **{self.current.title}**, la salto."
-                    )
-                continue
+    async def _reproducir(self, inicio: float, es_salto: bool):
+        """Lanza el audio de self.current, opcionalmente desde un segundo.
 
-            self.current_processes = (ytdlp_proc, ffmpeg_proc)
-            source = BufferedPCMSource(ffmpeg_proc.stdout)
+        La separamos del ciclo porque /seek necesita hacer exactamente esto
+        mismo sin pasar por la cola ni por la lógica de repetición."""
+        self.detener_karaoke()
 
-            await loop.run_in_executor(None, source.wait_until_ready, 20.0)
+        preparing_msg = None
+        if self.text_channel and not es_salto:
+            preparing_msg = await self.text_channel.send(
+                f"🔄 Preparando: **{self.current.title}**..."
+            )
 
-            source = discord.PCMVolumeTransformer(source, volume=self.volume)
+        loop = asyncio.get_event_loop()
+        try:
+            ytdlp_proc, ffmpeg_proc = await loop.run_in_executor(
+                None, spawn_playback_pipeline, self.current.webpage_url, inicio
+            )
+        except Exception:
+            log.exception("No se pudo lanzar el pipeline de audio")
+            aviso = (f"⚠️ No pude saltar dentro de **{self.current.title}**."
+                     if inicio > 0 else
+                     f"⚠️ No se pudo preparar **{self.current.title}**, la salto.")
+            if preparing_msg:
+                await preparing_msg.edit(content=aviso)
+            elif self.text_channel:
+                await self.text_channel.send(aviso)
+            if inicio > 0:
+                # El salto falló pero la canción seguía sonando: la cortamos
+                # nosotros, así que hay que destrabar el ciclo.
+                self.play_next_event.set()
+            return
 
-            def _after(error, guild_id=self.guild_id, procs=(ytdlp_proc, ffmpeg_proc)):
-                if error:
-                    log.error(f"Error en reproducción (guild {guild_id}): {error}")
-                for p in procs:
-                    if p.poll() is None:
-                        p.terminate()
-                if self.progress_task:
-                    self.bot.loop.call_soon_threadsafe(self.progress_task.cancel)
-                self.bot.loop.call_soon_threadsafe(self.play_next_event.set)
+        self.current_processes = (ytdlp_proc, ffmpeg_proc)
+        source = BufferedPCMSource(ffmpeg_proc.stdout)
 
-            self.voice_client.play(source, after=_after)
+        await loop.run_in_executor(None, source.wait_until_ready, 20.0)
 
-            self.playback_started_at = time.monotonic()
-            self.pause_started_at = None
-            self.total_paused_seconds = 0.0
+        source = discord.PCMVolumeTransformer(source, volume=self.volume)
 
-            self.history = [s for s in self.history if s.webpage_url != self.current.webpage_url]
+        def _after(error, guild_id=self.guild_id, procs=(ytdlp_proc, ffmpeg_proc)):
+            if error:
+                log.error(f"Error en reproducción (guild {guild_id}): {error}")
+            for p in procs:
+                if p is not None and p.poll() is None:
+                    p.terminate()
+            if self.progress_task:
+                self.bot.loop.call_soon_threadsafe(self.progress_task.cancel)
+            self.bot.loop.call_soon_threadsafe(self.play_next_event.set)
+
+        # El _after del audio anterior pudo llegar tarde y dejar el evento
+        # marcado. Si no lo limpiamos justo acá, el ciclo despertaría de
+        # inmediato creyendo que esta canción ya terminó y saltaría sola.
+        self.play_next_event.clear()
+        self.voice_client.play(source, after=_after)
+
+        self.playback_started_at = time.monotonic()
+        self.pause_started_at = None
+        self.total_paused_seconds = 0.0
+        self.seek_offset = inicio
+
+        if not es_salto:
+            self.history = [s for s in self.history
+                            if s.webpage_url != self.current.webpage_url]
             self.history.append(self.current)
             if len(self.history) > MAX_HISTORY:
                 self.history = self.history[-MAX_HISTORY:]
 
-            embed = build_now_playing_embed(self.current, 0, self.loop_mode)
-            view = MusicControls(self.cog, self.guild_id)
-            if preparing_msg:
-                await preparing_msg.edit(content=None, embed=embed, view=view)
-                self.now_playing_msg = preparing_msg
-            elif self.text_channel:
-                self.now_playing_msg = await self.text_channel.send(embed=embed, view=view)
+            estadisticas.registrar(self.guild_id, self.current.title,
+                                   self.current.webpage_url, self.current.requester)
+            await self.actualizar_presencia(self.current)
 
-            if self.progress_task:
-                self.progress_task.cancel()
-            self.progress_task = self.bot.loop.create_task(self._update_progress_loop())
+        embed = build_now_playing_embed(self.current, inicio, self.loop_mode)
+        view = MusicControls(self.cog, self.guild_id)
+        if preparing_msg:
+            await preparing_msg.edit(content=None, embed=embed, view=view)
+            self.now_playing_msg = preparing_msg
+        elif es_salto and self.now_playing_msg:
+            # Al saltar reusamos el mensaje que ya estaba, en vez de mandar
+            # uno nuevo por cada /seek.
+            try:
+                await self.now_playing_msg.edit(embed=embed, view=view)
+            except discord.HTTPException:
+                pass
+        elif self.text_channel:
+            self.now_playing_msg = await self.text_channel.send(embed=embed, view=view)
 
-            await self.play_next_event.wait()
+        if self.progress_task:
+            self.progress_task.cancel()
+        self.progress_task = self.bot.loop.create_task(self._update_progress_loop())
 
     def cleanup(self):
         self.player_task.cancel()
@@ -2506,6 +2743,372 @@ class Music(commands.Cog):
 
         await ctx.defer()
         await self.send_lyrics(ctx.followup.send, busqueda)
+
+    # ------------------------------------------------------------- saltar
+
+    @staticmethod
+    def _parsear_tiempo(texto: str) -> Optional[float]:
+        """Acepta '90', '1:30' y '1:02:05'. Devuelve segundos o None."""
+        partes = texto.strip().split(":")
+        if not 1 <= len(partes) <= 3:
+            return None
+        try:
+            numeros = [float(p) for p in partes]
+        except ValueError:
+            return None
+        if any(n < 0 for n in numeros):
+            return None
+
+        segundos = 0.0
+        for numero in numeros:
+            segundos = segundos * 60 + numero
+        return segundos
+
+    async def _saltar_a(self, ctx: discord.ApplicationContext, destino: float):
+        """Corta la reproducción actual y la relanza desde `destino`."""
+        state = self.get_state(ctx.guild.id)
+        if not state.current or not state.voice_client:
+            await ctx.respond("No hay nada sonando.", ephemeral=True)
+            return
+
+        duracion = state.current.duration
+        if not duracion:
+            await ctx.respond(
+                "Esta pista es en vivo o no tiene duración conocida, así que no "
+                "puedo saltar dentro de ella.", ephemeral=True)
+            return
+
+        destino = max(0.0, min(destino, max(0.0, duracion - 3)))
+
+        await ctx.defer()
+        state.pending_seek = destino
+        state.suppress_requeue = True
+        state.voice_client.stop()      # dispara _after y despierta el ciclo
+
+        await ctx.respond(
+            f"⏩ Saltando a **{format_duration(destino)}** de "
+            f"**{state.current.title}**...")
+
+    @commands.slash_command(name="seek", description="Salta a un momento de la canción (1:30, 90, 1:02:05)")
+    async def seek(
+        self,
+        ctx: discord.ApplicationContext,
+        momento: Option(str, "Minuto al que saltar: 1:30, 90 o 1:02:05"),
+    ):
+        segundos = self._parsear_tiempo(momento)
+        if segundos is None:
+            await ctx.respond(
+                f"No entendí **{momento}**. Usa `1:30`, `90` o `1:02:05`.",
+                ephemeral=True)
+            return
+        await self._saltar_a(ctx, segundos)
+
+    @commands.slash_command(name="adelantar", description="Adelanta unos segundos la canción")
+    async def adelantar(
+        self,
+        ctx: discord.ApplicationContext,
+        segundos: Option(int, "Cuántos segundos adelantar", default=30),
+    ):
+        state = self.get_state(ctx.guild.id)
+        await self._saltar_a(ctx, state.get_elapsed() + max(1, segundos))
+
+    @commands.slash_command(name="atrasar", description="Retrocede unos segundos la canción")
+    async def atrasar(
+        self,
+        ctx: discord.ApplicationContext,
+        segundos: Option(int, "Cuántos segundos retroceder", default=30),
+    ):
+        state = self.get_state(ctx.guild.id)
+        await self._saltar_a(ctx, state.get_elapsed() - max(1, segundos))
+
+    # ------------------------------------------------------------ autoplay
+
+    @commands.slash_command(name="autoplay", description="Al vaciarse la cola, sigue sola con canciones parecidas")
+    async def autoplay(
+        self,
+        ctx: discord.ApplicationContext,
+        modo: Option(str, "Encender o apagar", choices=["on", "off"]),
+    ):
+        state = self.get_state(ctx.guild.id)
+        state.autoplay = modo == "on"
+        set_guild_autoplay(ctx.guild.id, state.autoplay)
+        if not state.autoplay:
+            # Si estaba sonando una radio, la cortamos acá; lo que ya está en
+            # la cola sigue igual.
+            if state.active_playlist and state.active_playlist.get("es_radio"):
+                state.active_playlist = None
+            state._radio_desde = None
+
+        await ctx.respond(
+            "📻 Autoplay **encendido**. Cuando se acabe la cola sigo sola con "
+            "canciones parecidas a la última."
+            if state.autoplay else
+            "📻 Autoplay **apagado**. Al acabarse la cola me quedo callada.")
+
+    # ----------------------------------------------------------------- top
+
+    @commands.slash_command(name="top", description="Lo más escuchado en este servidor")
+    async def top(
+        self,
+        ctx: discord.ApplicationContext,
+        que: Option(str, "Qué ranking mostrar", choices=["canciones", "usuarios"],
+                    default="canciones"),
+    ):
+        reproducciones, distintas = estadisticas.totales(ctx.guild.id)
+        if not reproducciones:
+            await ctx.respond(
+                "Todavía no hay nada que contar. Pon música y vuelve más tarde ♡",
+                ephemeral=True)
+            return
+
+        embed = discord.Embed(color=discord.Color.blurple())
+        embed.set_footer(text=f"{reproducciones} reproducciones · "
+                              f"{distintas} canciones distintas")
+
+        if que == "usuarios":
+            embed.title = "🏆 Quién pone más música"
+            lineas = [f"**{i}.** {nombre} — {veces} canciones"
+                      for i, (nombre, veces) in
+                      enumerate(estadisticas.top_usuarios(ctx.guild.id), start=1)]
+        else:
+            embed.title = "🏆 Lo más escuchado"
+            lineas = []
+            for i, cancion in enumerate(estadisticas.top_canciones(ctx.guild.id), start=1):
+                titulo = cancion["titulo"][:70]
+                lineas.append(f"**{i}.** [{titulo}]({cancion['url']}) — "
+                              f"{cancion['veces']} veces")
+
+        embed.description = "\n".join(lineas) or "Nada todavía."
+        await ctx.respond(embed=embed)
+
+    # ----------------------------------------------------------- karaoke
+
+    @commands.slash_command(name="karaoke", description="Muestra la letra siguiendo la canción, verso a verso")
+    async def karaoke(self, ctx: discord.ApplicationContext):
+        state = self.get_state(ctx.guild.id)
+        if not state.current:
+            await ctx.respond("No hay ninguna canción sonando.", ephemeral=True)
+            return
+
+        if state.karaoke_task:
+            state.detener_karaoke()
+            await ctx.respond("🎤 Karaoke apagado.")
+            return
+
+        await ctx.defer()
+
+        async def enviar(**kwargs):
+            await ctx.respond(**kwargs)
+            return await ctx.interaction.original_response()
+
+        await self.arrancar_karaoke(state, enviar)
+
+    async def arrancar_karaoke(self, state: GuildMusicState, enviar):
+        """Busca la letra sincronizada y arranca el resaltado.
+
+        `enviar` manda el mensaje y devuelve el objeto Message, porque
+        después hay que ir editándolo. Cada sitio que llama acá arma su
+        propio `enviar` (no es lo mismo responder a un comando que a un
+        botón)."""
+        cancion = state.current
+        artista, titulo = split_artist_title(clean_title_for_lyrics_search(cancion.title))
+        if not artista:
+            artista = clean_artist_name(cancion.uploader)
+
+        loop = asyncio.get_event_loop()
+        letra = await loop.run_in_executor(
+            None, lrc.buscar, titulo, artista, cancion.duration)
+
+        if not letra:
+            await enviar(content=(
+                f"No encontré letra sincronizada de **{cancion.title}**.\n"
+                f"Prueba con `/lyrics`, que la trae aunque sea sin tiempos."))
+            return
+
+        mensaje = await enviar(embed=discord.Embed(
+            title=f"🎤 {letra['artista']} - {letra['titulo']}"[:256],
+            description="Preparando...", color=discord.Color.blurple()))
+
+        state.karaoke_msg = mensaje
+        state.karaoke_task = self.bot.loop.create_task(
+            self._bucle_karaoke(state, cancion, letra))
+
+    async def _bucle_karaoke(self, state: GuildMusicState, cancion: "Song", letra: dict):
+        """Va editando el mensaje para resaltar el verso que suena.
+
+        Solo edita cuando el verso cambia de verdad: si editáramos cada
+        pocos segundos pasara lo que pasara, Discord nos limitaría igual que
+        con la barra de progreso."""
+        versos = letra["versos"]
+        ultimo_indice = None
+        try:
+            while True:
+                if state.current is not cancion or not state.karaoke_msg:
+                    break
+                if not (state.voice_client and state.voice_client.is_connected()):
+                    break
+
+                indice = lrc.indice_actual(versos, state.get_elapsed())
+                if indice != ultimo_indice:
+                    ultimo_indice = indice
+                    embed = discord.Embed(
+                        title=f"🎤 {letra['artista']} - {letra['titulo']}"[:256],
+                        description=lrc.ventana(versos, indice) or "♪",
+                        color=discord.Color.blurple())
+                    embed.set_footer(
+                        text=f"verso {max(indice, 0) + 1}/{len(versos)} · "
+                             f"lrclib · /karaoke para apagarlo")
+                    try:
+                        await state.karaoke_msg.edit(embed=embed)
+                    except discord.HTTPException:
+                        break
+
+                await asyncio.sleep(KARAOKE_UPDATE_SECONDS)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            state.karaoke_task = None
+
+    # --------------------------------------------------------- playlists
+
+    playlist = discord.SlashCommandGroup("playlist", "Playlists guardadas del servidor")
+
+    @playlist.command(name="crear", description="Crea una playlist vacía")
+    async def playlist_crear(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "Nombre de la playlist"),
+    ):
+        _, mensaje = pls.crear(ctx.guild.id, nombre, ctx.author.display_name)
+        await ctx.respond(mensaje)
+
+    @playlist.command(name="agregar", description="Agrega la canción actual (o un link) a una playlist")
+    async def playlist_agregar(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "A qué playlist"),
+        link: Option(str, "Link a agregar; vacío = la que está sonando", required=False) = None,
+    ):
+        await ctx.defer()
+
+        if link:
+            try:
+                info = await self._extract(link)
+            except Exception:
+                log.exception("No pude leer el link para la playlist")
+                await self._safe_respond(ctx, "No pude leer ese link.")
+                return
+            cancion = {
+                "titulo": info.get("title", "Sin título"),
+                "url": info.get("webpage_url") or info.get("url") or link,
+                "duracion": info.get("duration"),
+            }
+        else:
+            actual = self.get_state(ctx.guild.id).current
+            if not actual:
+                await self._safe_respond(
+                    ctx, "No hay nada sonando. Pásame un link o pon una canción.")
+                return
+            cancion = {"titulo": actual.title, "url": actual.webpage_url,
+                       "duracion": actual.duration}
+
+        _, mensaje = pls.agregar(ctx.guild.id, nombre, cancion)
+        await self._safe_respond(ctx, mensaje)
+
+    @playlist.command(name="tocar", description="Encola todas las canciones de una playlist")
+    async def playlist_tocar(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "Qué playlist reproducir"),
+    ):
+        real, lista = pls.buscar(ctx.guild.id, nombre)
+        if not real:
+            await ctx.respond(f"No existe ninguna playlist llamada **{nombre}**.",
+                              ephemeral=True)
+            return
+
+        canciones = lista.get("canciones", [])
+        if not canciones:
+            await ctx.respond(f"**{real}** está vacía.", ephemeral=True)
+            return
+
+        await ctx.defer()
+        agregadas = 0
+        for cancion in canciones:
+            resultado, _ = await self.handle_play_request(
+                ctx.guild, ctx.author, ctx.channel,
+                cancion.get("titulo", "Sin título"), cancion["url"],
+                cancion.get("duracion"), None,
+            )
+            if resultado is None:      # no está en un canal de voz
+                await self._safe_respond(ctx, "Tienes que estar en un canal de voz primero.")
+                return
+            agregadas += 1
+
+        await self._safe_respond(
+            ctx, f"🎶 Encolé **{agregadas}** canciones de **{real}**.")
+
+    @playlist.command(name="ver", description="Muestra las playlists, o el contenido de una")
+    async def playlist_ver(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "Cuál ver; vacío = listar todas", required=False) = None,
+    ):
+        if not nombre:
+            nombres = pls.nombres(ctx.guild.id)
+            if not nombres:
+                await ctx.respond(
+                    "Este servidor no tiene playlists todavía. Crea una con "
+                    "`/playlist crear`.", ephemeral=True)
+                return
+            lineas = []
+            for n in nombres:
+                datos = pls.todas(ctx.guild.id)[n]
+                lineas.append(f"**{n}** — {len(datos.get('canciones', []))} canciones "
+                              f"· de {datos.get('creada_por', '?')}")
+            embed = discord.Embed(title="📚 Playlists del servidor",
+                                  description="\n".join(lineas),
+                                  color=discord.Color.blurple())
+            await ctx.respond(embed=embed)
+            return
+
+        real, lista = pls.buscar(ctx.guild.id, nombre)
+        if not real:
+            await ctx.respond(f"No existe ninguna playlist llamada **{nombre}**.",
+                              ephemeral=True)
+            return
+
+        canciones = lista.get("canciones", [])
+        lineas = [f"**{i}.** [{c.get('titulo', 'Sin título')[:60]}]({c['url']})"
+                  for i, c in enumerate(canciones[:25], start=1)]
+        if len(canciones) > 25:
+            lineas.append(f"*...y {len(canciones) - 25} más*")
+
+        embed = discord.Embed(title=f"📚 {real}",
+                              description="\n".join(lineas) or "Está vacía.",
+                              color=discord.Color.blurple())
+        embed.set_footer(text=f"{len(canciones)} canciones · creada por "
+                              f"{lista.get('creada_por', '?')}")
+        await ctx.respond(embed=embed)
+
+    @playlist.command(name="quitar", description="Quita una canción de una playlist por su posición")
+    async def playlist_quitar(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "De qué playlist"),
+        posicion: Option(int, "Posición en la lista (mírala con /playlist ver)"),
+    ):
+        _, mensaje = pls.quitar(ctx.guild.id, nombre, posicion)
+        await ctx.respond(mensaje)
+
+    @playlist.command(name="borrar", description="Borra una playlist entera")
+    async def playlist_borrar(
+        self,
+        ctx: discord.ApplicationContext,
+        nombre: Option(str, "Cuál borrar"),
+    ):
+        _, mensaje = pls.borrar(ctx.guild.id, nombre)
+        await ctx.respond(mensaje)
 
     @commands.slash_command(name="skip", description="Salta la canción actual")
     async def skip(self, ctx: discord.ApplicationContext):
