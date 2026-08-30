@@ -40,7 +40,7 @@ YTDL_OPTS = {
     "remote_components": "ejs:github",
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios", "mweb"]
+            "player_client": ["web_embedded", "android", "ios", "mweb"]
         }
     },
 }
@@ -61,6 +61,7 @@ PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_BYTES_PER_SAMPLE
 FRAME_SIZE = 3840
 
 PREBUFFER_SECONDS = float(os.getenv("PREBUFFER_SECONDS", "30"))
+UNDERRUN_WAIT_SECONDS = float(os.getenv("UNDERRUN_WAIT_SECONDS", "3"))
 PREBUFFER_BYTES = int(PREBUFFER_SECONDS * PCM_BYTES_PER_SECOND)
 
 MAX_BUFFER_BYTES = int(os.getenv("MAX_BUFFER_BYTES", str(500 * 1024 * 1024)))
@@ -213,7 +214,7 @@ def spawn_playback_pipeline(webpage_url: str,
         "--no-warnings",
         "--no-playlist",
         "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=android,ios,mweb",
+        "--extractor-args", "youtube:player_client=web_embedded,android,ios,mweb",
         *_cookie_cli_args(),
         webpage_url,
     ]
@@ -298,6 +299,16 @@ class BufferedPCMSource(discord.AudioSource):
 
     def read(self) -> bytes:
         with self._cond:
+            if (self._pending_bytes() < FRAME_SIZE and not self._eof
+                    and not self._closed):
+                limite = time.monotonic() + UNDERRUN_WAIT_SECONDS
+                while (self._pending_bytes() < FRAME_SIZE and not self._eof
+                       and not self._closed):
+                    restante = limite - time.monotonic()
+                    if restante <= 0:
+                        break
+                    self._cond.wait(restante)
+
             if self._pending_bytes() >= FRAME_SIZE:
                 if self._underrun_started_at is not None:
                     stalled_seconds = time.monotonic() - self._underrun_started_at
