@@ -1476,16 +1476,14 @@ class TopView(discord.ui.View):
     @discord.ui.button(label="🎵 Top canciones", style=discord.ButtonStyle.primary)
     async def top_songs(self, button: discord.ui.Button,
                         interaction: discord.Interaction):
-        await interaction.response.edit_message(
-            content=None, embed=self.cog.embed_top(self.guild_id, "songs"),
-            view=self)
+        await interaction.response.send_message(
+            embed=self.cog.embed_top(self.guild_id, "songs"), ephemeral=False)
 
     @discord.ui.button(label="👑 Top personas", style=discord.ButtonStyle.secondary)
     async def top_personas(self, button: discord.ui.Button,
                            interaction: discord.Interaction):
-        await interaction.response.edit_message(
-            content=None, embed=self.cog.embed_top(self.guild_id, "users"),
-            view=self)
+        await interaction.response.send_message(
+            embed=self.cog.embed_top(self.guild_id, "users"), ephemeral=False)
 
     async def on_timeout(self):
         for item in self.children:
@@ -3071,6 +3069,31 @@ class Music(commands.Cog):
         if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
             state.voice_client.stop()
         await ctx.respond("⏹️ Detenido y cola vaciada.")
+
+    @commands.slash_command(name="join", description="Entra al canal de voz donde estés")
+    async def join(self, ctx: discord.ApplicationContext):
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.respond("Tienes que estar en un canal de voz primero.",
+                              ephemeral=True)
+            return
+
+        channel = ctx.author.voice.channel
+        state = self.get_state(ctx.guild.id)
+        state.text_channel = ctx.channel
+
+        if ctx.guild.voice_client is None or not ctx.guild.voice_client.is_connected():
+            state.voice_client = await channel.connect()
+            state.history = []
+            await ctx.respond(f"👋 Entré a **{channel.name}**.")
+            return
+
+        state.voice_client = ctx.guild.voice_client
+        if state.voice_client.channel.id == channel.id:
+            await ctx.respond(f"Ya estoy en **{channel.name}**.", ephemeral=True)
+            return
+
+        await state.voice_client.move_to(channel)
+        await ctx.respond(f"👋 Me pasé a **{channel.name}**.")
 
     @commands.slash_command(name="leave", description="Saca al bot del canal de voz")
     async def leave(self, ctx: discord.ApplicationContext):
